@@ -36,7 +36,7 @@ scripts/build-linux.sh steamrt4   # just one
 
 ### CI
 
-`.github/workflows/build.yml` runs Windows, SteamRT3 and SteamRT4 as separate jobs (the Linux ones through `.github/workflows/linux-build.yml`). A manual run (Actions → CI → Run workflow) can build just one of them. Pushing a tag builds all three and attaches them to a GitHub release.
+`.github/workflows/build.yml` runs Windows, SteamRT3 and SteamRT4 as separate jobs (the Linux ones through `.github/workflows/linux-build.yml`). A manual run (Actions → CI → Run workflow) can build just one of them. Releases are automatic: on a push to `master`, if the version returned by `AcceleratorCS2::GetVersion()` in `extension.cpp` has no `v<version>` release yet, the tag and a GitHub release with all three packages are created. Bump `GetVersion()` to publish a new release; other pushes don't release anything.
 
 ### Self-hosted CI runner
 
