@@ -1,27 +1,28 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: What to build
+        type: choice
+        default: all
+        options:
+          - all
+          - steamrt3
+          - steamrt4
+          - windows
 
 jobs:
-  build:
-    name: ${{ matrix.name }} Build
-    runs-on: ${{ matrix.os }}
+  windows:
+    name: Windows Build
+    if: ${{ !inputs.target || inputs.target == 'all' || inputs.target == 'windows' }}
+    runs-on: windows-latest
     env:
       HL2SDKCS2: ${{ github.workspace }}/hl2sdk-cs2
       MMSOURCE_DEV: ${{ github.workspace }}/mmsource-2.0
-    container: ${{ matrix.container }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            name: Windows
-          - os: ubuntu-latest
-            name: SteamRT3
-            container: ghcr.io/source2ze/build-containers:steamrt3
-          - os: ubuntu-latest
-            name: SteamRT4
-            container: ghcr.io/source2ze/build-containers:steamrt4
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -46,42 +47,49 @@ jobs:
           path: hl2sdk-cs2
 
       - name: Install Premake5
-        if: matrix.os == 'windows-latest'
         uses: abel0b/setup-premake@v2.4
         with:
           version: '5.0.0-beta8'
 
       - name: Setup MSBuild
-        if: matrix.os == 'windows-latest'
         uses: microsoft/setup-msbuild@v3
 
-      - name: Windows Build
-        if: matrix.os == 'windows-latest'
+      - name: Build
         working-directory: AcceleratorCS2
         run: |
           premake5 vs2026
           msbuild build/AcceleratorCS2.slnx /m /p:Configuration=Release /p:Platform=x64
           premake5 package
 
-      - name: Linux Build
-        if: matrix.os == 'ubuntu-latest'
-        working-directory: AcceleratorCS2
-        run: |
-          premake5 gmake
-          make -C build config=release_x64 -j$(nproc)
-          premake5 package
-
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.name }}
+          name: Windows
           path: AcceleratorCS2/build/package/AcceleratorCS2
+
+  steamrt3:
+    name: SteamRT3
+    if: ${{ !inputs.target || inputs.target == 'all' || inputs.target == 'steamrt3' }}
+    uses: ./.github/workflows/linux-build.yml
+    with:
+      runtime: steamrt3
+      artifact: SteamRT3
+
+  steamrt4:
+    name: SteamRT4
+    if: ${{ !inputs.target || inputs.target == 'all' || inputs.target == 'steamrt4' }}
+    uses: ./.github/workflows/linux-build.yml
+    with:
+      runtime: steamrt4
+      artifact: SteamRT4
 
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [windows, steamrt3, steamrt4]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download artifacts

@@ -1,0 +1,59 @@
+name: Linux Build
+
+# One Linux package, built inside the matching image from docker/ via scripts/build-linux.sh
+# (the same script used for local builds). Called once per Steam Runtime from build.yml.
+
+on:
+  workflow_call:
+    inputs:
+      runtime:
+        description: steamrt3 or steamrt4
+        required: true
+        type: string
+      artifact:
+        description: Name of the uploaded artifact
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build
+    # Self-hosted when the repository variable SELF_HOSTED_LINUX is "true". Pull requests always use
+    # GitHub-hosted runners: this repository is public, and a fork's PR must never get to execute code
+    # on the self-hosted machine.
+    runs-on: ${{ vars.SELF_HOSTED_LINUX == 'true' && github.event_name != 'pull_request' && fromJSON('["self-hosted", "linux", "x64"]') || 'ubuntu-latest' }}
+    env:
+      HL2SDKCS2: ${{ github.workspace }}/hl2sdk-cs2
+      MMSOURCE_DEV: ${{ github.workspace }}/mmsource-2.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          path: AcceleratorCS2
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout Metamod
+        uses: actions/checkout@v7
+        with:
+          repository: alliedmodders/metamod-source
+          ref: master
+          path: mmsource-2.0
+          submodules: recursive
+
+      - name: Checkout HL2SDK
+        uses: actions/checkout@v7
+        with:
+          repository: alliedmodders/hl2sdk
+          ref: cs2
+          path: hl2sdk-cs2
+
+      - name: Build
+        working-directory: AcceleratorCS2
+        run: scripts/build-linux.sh ${{ inputs.runtime }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: AcceleratorCS2/dist/${{ inputs.runtime }}
