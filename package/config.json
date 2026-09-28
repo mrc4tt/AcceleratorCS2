@@ -1,3 +1,7 @@
 {
-  "MinidumpAccountSteamId64": ""
+  "MinidumpAccountSteamId64": "",
+  "UploadCrashDumps": false,
+  "IgnoreShutdownCrashes": true,
+  "CrashLoopMaxDumps": 5,
+  "CrashLoopWindowMinutes": 10
 }

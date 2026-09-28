@@ -176,8 +176,6 @@ PresubmitResponse PresubmitCrashDump(const char* path, char* tokenBuffer, size_t
 	params["ServerID"] = g_serverId;
 	params["CrashSignature"] = summary;
 
-	printf("signature %s\n", summary.c_str());
-
 	std::string resAscii;
 	long int res_code;
 	bool success = google_breakpad::HTTPUpload::SendRequest("http://crash.limetech.org/submit", params, files, "", "", "", &resAscii, &res_code, nullptr);

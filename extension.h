@@ -3,6 +3,7 @@
 #include <ISmmPlugin.h>
 #include <igameevents.h>
 #include <iserver.h>
+#include <icvar.h>
 
 class AcceleratorCS2 : public ISmmPlugin, public IMetamodListener
 {
@@ -20,5 +21,7 @@ public:
 	const char* GetLogTag();
 public: // Hooks
 	KHook::Return<void> GameFrame(IServerGameDLL* pThis, bool simulating, bool bFirstTick, bool bLastTick);
+	KHook::Return<void> PreShutdown(IServerGameDLL* pThis);
+	KHook::Return<void> DispatchConCommand(ICvar* pThis, ConCommandRef cmd, const CCommandContext& ctx, const CCommand& args);
 	KHook::Return<void> StartupServer(INetworkServerService* pThis, const GameSessionConfiguration_t& config, ISource2WorldSession*, const char*);
 };
