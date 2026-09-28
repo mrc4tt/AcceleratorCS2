@@ -16,6 +16,12 @@ case "$TARGET" in
 	*) echo "usage: $0 [steamrt3|steamrt4|all]" >&2; exit 1 ;;
 esac
 
+if ! docker info >/dev/null 2>&1; then
+	echo "error: $(whoami) cannot talk to docker. Add it to the docker group (sudo usermod -aG docker $(whoami))" >&2
+	echo "       and restart the session, or the runner service (sudo ./svc.sh stop && sudo ./svc.sh start) on a CI runner." >&2
+	exit 1
+fi
+
 SDK="${HL2SDKCS2:-$ROOT/.deps/hl2sdk-cs2}"
 MM="${MMSOURCE_DEV:-$ROOT/.deps/mmsource-2.0}"
 
