@@ -7,6 +7,8 @@
 #include "common/linux/http_upload.h"
 
 #include <dirent.h>
+#include <dlfcn.h>
+#include <ucontext.h>
 #include <unistd.h>
 #else
 #include "client/windows/handler/exception_handler.h"
@@ -368,6 +370,39 @@ static void WriteProcessState(FILE* out, const google_breakpad::ProcessState& st
 void (*SignalHandler)(int, siginfo_t*, void*);
 const int kExceptionSignals[] = { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS };
 const int kNumHandledSignals = std::size(kExceptionSignals);
+
+// The .NET runtime (CounterStrikeSharp) relies on its own handler to turn faults in JIT code into managed
+// exceptions such as NullReferenceException. Overwriting it turns every caught C# null dereference into a
+// crash, so it is kept and called first for faults outside any loaded image (where JIT code lives).
+static void (*clrSignalHandlers[kNumHandledSignals])(int, siginfo_t*, void*);
+
+static bool IsClrSignalHandler(const struct sigaction& action)
+{
+	Dl_info info;
+	return (action.sa_flags & SA_SIGINFO) && action.sa_sigaction &&
+		dladdr((void*)action.sa_sigaction, &info) && info.dli_fname && strstr(info.dli_fname, "libcoreclr.so");
+}
+
+static void AcceleratorSignalHandler(int sig, siginfo_t* info, void* ucontext)
+{
+	for (int i = 0; i < kNumHandledSignals; ++i)
+	{
+		if (kExceptionSignals[i] != sig || !clrSignalHandlers[i])
+			continue;
+
+		Dl_info dl;
+		void* faultIp = (void*)((ucontext_t*)ucontext)->uc_mcontext.gregs[REG_RIP];
+		if (!dladdr(faultIp, &dl))
+		{
+			// Managed code: the runtime raises an exception, or chains to its previous handler itself.
+			clrSignalHandlers[i](sig, info, ucontext);
+			return;
+		}
+		break;
+	}
+
+	SignalHandler(sig, info, ucontext);
+}
 
 // docker stop / Pterodactyl kill send SIGTERM, Ctrl+C sends SIGINT, a closed screen/tmux sends SIGHUP.
 const int kShutdownSignals[] = { SIGTERM, SIGINT, SIGHUP };
@@ -1132,10 +1167,12 @@ KHook::Return<void> AcceleratorCS2::GameFrame(IServerGameDLL* pThis, bool simula
 	{
 		sigaction(kExceptionSignals[i], NULL, &oact);
 
-		if (oact.sa_sigaction != SignalHandler)
+		if (oact.sa_sigaction != AcceleratorSignalHandler)
 		{
+			if (IsClrSignalHandler(oact))
+				clrSignalHandlers[i] = oact.sa_sigaction;
+
 			weHaveBeenFuckedOver = true;
-			break;
 		}
 	}
 
@@ -1149,7 +1186,7 @@ KHook::Return<void> AcceleratorCS2::GameFrame(IServerGameDLL* pThis, bool simula
 	for (int i = 0; i < kNumHandledSignals; ++i)
 		sigaddset(&act.sa_mask, kExceptionSignals[i]);
 
-	act.sa_sigaction = SignalHandler;
+	act.sa_sigaction = AcceleratorSignalHandler;
 	act.sa_flags = SA_ONSTACK | SA_SIGINFO;
 
 	for (int i = 0; i < kNumHandledSignals; ++i)
@@ -1198,7 +1235,7 @@ const char* AcceleratorCS2::GetLicense()
 
 const char* AcceleratorCS2::GetVersion()
 {
-	return "3.2";
+	return "3.3";
 }
 
 const char* AcceleratorCS2::GetDate()
@@ -1213,7 +1250,7 @@ const char* AcceleratorCS2::GetLogTag()
 
 const char* AcceleratorCS2::GetAuthor()
 {
-	return "Poggu, Phoenix (˙·٠●Феникс●٠·˙), asherkin";
+	return "Poggu, Phoenix (˙·٠●Феникс●٠·˙), asherkin, Miksen";
 }
 
 const char* AcceleratorCS2::GetDescription()
