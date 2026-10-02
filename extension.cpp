@@ -292,7 +292,7 @@ static void WriteInstructionBytes(FILE* out, google_breakpad::Minidump& dump, ui
 
 static void WriteFrames(FILE* out, const google_breakpad::CallStack* stack, size_t maxFrames, bool registers)
 {
-	size_t frameCount = std::min(stack->frames()->size(), maxFrames);
+	size_t frameCount = (std::min)(stack->frames()->size(), maxFrames);
 	for (size_t i = 0; i < frameCount; ++i)
 	{
 		const google_breakpad::StackFrame* frame = stack->frames()->at(i);

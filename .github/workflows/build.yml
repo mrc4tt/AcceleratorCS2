@@ -57,6 +57,8 @@ jobs:
       - name: Build
         working-directory: AcceleratorCS2
         run: |
+          # Stop at the first failing command, otherwise a compile error only shows up later as a missing DLL.
+          $PSNativeCommandUseErrorActionPreference = $true
           premake5 vs2026
           msbuild build/AcceleratorCS2.slnx /m /p:Configuration=Release /p:Platform=x64
           premake5 package
