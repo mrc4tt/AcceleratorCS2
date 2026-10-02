@@ -14,6 +14,16 @@ The configuration file is located at `AcceleratorCS2/config.json`.
 | `CrashLoopMaxDumps` | `5` | Stop writing new dumps once this many were written within `CrashLoopWindowMinutes`, so a crash-looping server doesn't fill the disk. `0` disables. |
 | `CrashLoopWindowMinutes` | `10` | Window used by `CrashLoopMaxDumps`. |
 
+## Dump metadata
+
+Each dump gets a `<id>.dmp.txt` next to it:
+
+- `CONFIG` block: map, game path, command line.
+- `CONTEXT` block: uptime, installed CounterStrikeSharp plugins (these load from memory and never show up in the module list), and the last 16 console commands. Arguments of commands whose name contains `pass`, `rcon`, `token`, `key`, `secret` or `auth` are hidden. Client commands such as `say` are recorded too.
+- Stack walk, plus the bytes at the crashing instruction. Compiler-generated null-dereference traps (`mov rax,[0]; ud2`) are called out. These blocks often sit just before the entry point of the function that jumped to them, so address-to-function tools blame the wrong function.
+
+The stack walk runs inside the crashing process. After heap corruption (glibc `double free or corruption` → SIGABRT) this can fail and leave only the `CONFIG`/`CONTEXT` blocks. The missing stack walk is then added on the next server start, before any upload.
+
 ## Linux builds
 
 | Package | Built in | Runs on |
