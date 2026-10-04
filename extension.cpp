@@ -8,6 +8,7 @@
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <ucontext.h>
 #include <unistd.h>
 #else
@@ -371,34 +372,304 @@ void (*SignalHandler)(int, siginfo_t*, void*);
 const int kExceptionSignals[] = { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS };
 const int kNumHandledSignals = std::size(kExceptionSignals);
 
-// The .NET runtime (CounterStrikeSharp) relies on its own handler to turn faults in JIT code into managed
-// exceptions such as NullReferenceException. Overwriting it turns every caught C# null dereference into a
-// crash, so it is kept and called first for faults outside any loaded image (where JIT code lives).
-static void (*clrSignalHandlers[kNumHandledSignals])(int, siginfo_t*, void*);
+// Runtimes such as .NET (CounterStrikeSharp, SwiftlyS2) rely on their own handler to turn faults in their generated
+// code into managed exceptions such as NullReferenceException. Overwriting it turns every caught C# null dereference
+// into a crash, so the handler we displace (whether it was there before Load or installed later) is kept and gets the
+// first look at faults in code that does not belong to a native image.
+static void AcceleratorSignalHandler(int sig, siginfo_t* info, void* ucontext);
 
-static bool IsClrSignalHandler(const struct sigaction& action)
+static struct sigaction foreignActions[kNumHandledSignals];
+static bool hasForeignAction[kNumHandledSignals];
+// Basename of the image the foreign handler lives in, e.g. libcoreclr.so, whose JIT helpers also raise managed faults.
+static char foreignImages[kNumHandledSignals][256];
+
+// Set while a foreign handler runs on this thread so a handler that chains back to us is not called again.
+static __thread void* tlsForwardContext __attribute__((tls_model("initial-exec")));
+static __thread void* tlsForwardFrame __attribute__((tls_model("initial-exec")));
+static __thread bool tlsForwardDumped __attribute__((tls_model("initial-exec")));
+
+// A handler may fix the cause and return without moving the pc, so the instruction is retried. When the same
+// instruction faults on the same address again right away, the handler did not fix anything and we dump instead.
+static __thread uintptr_t tlsRetryPc __attribute__((tls_model("initial-exec")));
+static __thread void* tlsRetryAddr __attribute__((tls_model("initial-exec")));
+static __thread int64_t tlsRetryStart __attribute__((tls_model("initial-exec")));
+static __thread int tlsRetryCount __attribute__((tls_model("initial-exec")));
+// A real re-fault loop retries thousands of times per millisecond, a legitimate fix-up never gets close.
+const int kMaxForwardRetries = 64;
+const int64_t kForwardRetryWindowNs = 100000000;
+
+static bool IsForeignAction(const struct sigaction& action)
 {
-	Dl_info info;
-	return (action.sa_flags & SA_SIGINFO) && action.sa_sigaction &&
-		dladdr((void*)action.sa_sigaction, &info) && info.dli_fname && strstr(info.dli_fname, "libcoreclr.so");
+	if (action.sa_flags & SA_SIGINFO)
+		return action.sa_sigaction && action.sa_sigaction != AcceleratorSignalHandler && action.sa_sigaction != SignalHandler;
+
+	return action.sa_handler != SIG_DFL && action.sa_handler != SIG_IGN;
+}
+
+// Not called from signal context, dladdr is not async-signal-safe.
+static void RememberForeignAction(int i, const struct sigaction& action)
+{
+	hasForeignAction[i] = false;
+	foreignActions[i] = action;
+	foreignImages[i][0] = '\0';
+
+	Dl_info dl;
+	void* fn = (action.sa_flags & SA_SIGINFO) ? (void*)action.sa_sigaction : (void*)action.sa_handler;
+	if (dladdr(fn, &dl) && dl.dli_fname)
+	{
+		const char* base = strrchr(dl.dli_fname, '/');
+		strncpy(foreignImages[i], base ? base + 1 : dl.dli_fname, sizeof(foreignImages[i]) - 1);
+		foreignImages[i][sizeof(foreignImages[i]) - 1] = '\0';
+	}
+
+	hasForeignAction[i] = true;
+}
+
+static uintptr_t GetFaultPc(void* ucontext)
+{
+	const ucontext_t* uc = (const ucontext_t*)ucontext;
+#if defined(__x86_64__)
+	return uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__i386__)
+	return uc->uc_mcontext.gregs[REG_EIP];
+#elif defined(__aarch64__)
+	return uc->uc_mcontext.pc;
+#else
+	return 0;
+#endif
+}
+
+static uintptr_t ParseHex(const char** p)
+{
+	uintptr_t value = 0;
+	for (;; ++*p)
+	{
+		char c = **p;
+		if (c >= '0' && c <= '9')
+			value = (value << 4) | (c - '0');
+		else if (c >= 'a' && c <= 'f')
+			value = (value << 4) | (c - 'a' + 10);
+		else
+			return value;
+	}
+}
+
+// Async-signal-safe (open/read/close only) lookup of the mapping containing addr in /proc/self/maps.
+static bool FindMapping(uintptr_t addr, bool* exec, char* path, size_t pathSize)
+{
+	int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+
+	char buf[4096];
+	char line[512];
+	size_t lineLen = 0;
+	bool found = false;
+	bool done = false;
+	ssize_t n;
+
+	while (!done && (n = read(fd, buf, sizeof(buf))) > 0)
+	{
+		for (ssize_t j = 0; j < n && !done; ++j)
+		{
+			if (buf[j] != '\n')
+			{
+				if (lineLen < sizeof(line) - 1)
+					line[lineLen++] = buf[j];
+				continue;
+			}
+
+			line[lineLen] = '\0';
+			lineLen = 0;
+
+			// start-end perms offset dev inode path
+			const char* p = line;
+			uintptr_t start = ParseHex(&p);
+			if (*p++ != '-')
+				continue;
+			uintptr_t end = ParseHex(&p);
+
+			// Mappings are sorted by address.
+			if (addr < start)
+			{
+				done = true;
+				break;
+			}
+			if (addr >= end)
+				continue;
+
+			while (*p == ' ')
+				++p;
+			*exec = p[0] && p[1] && p[2] == 'x';
+
+			for (int field = 0; field < 4; ++field)
+			{
+				while (*p && *p != ' ')
+					++p;
+				while (*p == ' ')
+					++p;
+			}
+
+			size_t k = 0;
+			for (; p[k] && k < pathSize - 1; ++k)
+				path[k] = p[k];
+			path[k] = '\0';
+
+			found = done = true;
+		}
+	}
+
+	close(fd);
+	return found;
+}
+
+// Matches the basename of a /proc/self/maps path, which may carry a " (deleted)" suffix.
+static bool BasenameMatches(const char* path, const char* image)
+{
+	const char* slash = strrchr(path, '/');
+	const char* base = slash ? slash + 1 : path;
+	size_t len = strlen(image);
+	return len && strncmp(base, image, len) == 0 && (base[len] == '\0' || base[len] == ' ');
+}
+
+// Code the foreign handler may turn into a managed exception: anonymous executable memory (JIT code and stubs),
+// the W^X double mapping, ReadyToRun .dll images mapped by the runtime, and the runtime's own image (JIT helpers).
+static bool IsForeignCode(int i, uintptr_t pc)
+{
+	bool exec = false;
+	char path[512];
+	if (!pc || !FindMapping(pc, &exec, path, sizeof(path)) || !exec)
+		return false;
+
+	if (path[0] == '\0' || strncmp(path, "[anon", 5) == 0 || strncmp(path, "/memfd:", 7) == 0)
+		return true;
+
+	if (path[0] != '/')
+		return false;
+
+	if (strstr(path, ".dll"))
+		return true;
+
+	return BasenameMatches(path, foreignImages[i]);
+}
+
+// The saved handler must still be executable code in the image it came from, never a pointer into an unloaded library.
+static bool IsForeignActionMapped(int i)
+{
+	const struct sigaction& action = foreignActions[i];
+	uintptr_t fn = (action.sa_flags & SA_SIGINFO) ? (uintptr_t)action.sa_sigaction : (uintptr_t)action.sa_handler;
+
+	bool exec = false;
+	char path[512];
+	if (!FindMapping(fn, &exec, path, sizeof(path)) || !exec)
+		return false;
+
+	return !foreignImages[i][0] || BasenameMatches(path, foreignImages[i]);
+}
+
+static int64_t MonotonicNs()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static bool IsSameRetrySite(uintptr_t pc, siginfo_t* info, int64_t now)
+{
+	return tlsRetryCount && tlsRetryPc == pc && tlsRetryAddr == info->si_addr && now - tlsRetryStart < kForwardRetryWindowNs;
+}
+
+// True once the same instruction kept faulting on the same address after the foreign handler returned for a retry.
+static bool IsRepeatedFault(uintptr_t pc, siginfo_t* info)
+{
+	return IsSameRetrySite(pc, info, MonotonicNs()) && tlsRetryCount >= kMaxForwardRetries;
+}
+
+static void RecordRetry(uintptr_t pc, siginfo_t* info)
+{
+	int64_t now = MonotonicNs();
+	if (IsSameRetrySite(pc, info, now))
+	{
+		++tlsRetryCount;
+		return;
+	}
+
+	tlsRetryPc = pc;
+	tlsRetryAddr = info->si_addr;
+	tlsRetryStart = now;
+	tlsRetryCount = 1;
+}
+
+// Runs a handler the way the kernel would have: with its own sa_mask added to the interrupted mask.
+static void CallAction(const struct sigaction& action, int sig, siginfo_t* info, void* ucontext)
+{
+	sigset_t mask = ((ucontext_t*)ucontext)->uc_sigmask;
+	sigorset(&mask, &mask, &action.sa_mask);
+	if (!(action.sa_flags & SA_NODEFER))
+		sigaddset(&mask, sig);
+
+	sigset_t saved;
+	sigprocmask(SIG_SETMASK, &mask, &saved);
+
+	if (action.sa_flags & SA_SIGINFO)
+		action.sa_sigaction(sig, info, ucontext);
+	else
+		action.sa_handler(sig);
+
+	sigprocmask(SIG_SETMASK, &saved, NULL);
 }
 
 static void AcceleratorSignalHandler(int sig, siginfo_t* info, void* ucontext)
 {
+	void* frame = __builtin_frame_address(0);
+
+	// The foreign handler did not recognise the fault and chained to its previous handler, which is us.
+	if (tlsForwardContext == ucontext && (uintptr_t)frame < (uintptr_t)tlsForwardFrame)
+	{
+		tlsForwardDumped = true;
+		SignalHandler(sig, info, ucontext);
+		return;
+	}
+
 	for (int i = 0; i < kNumHandledSignals; ++i)
 	{
-		if (kExceptionSignals[i] != sig || !clrSignalHandlers[i])
+		if (kExceptionSignals[i] != sig)
 			continue;
 
-		Dl_info dl;
-		void* faultIp = (void*)((ucontext_t*)ucontext)->uc_mcontext.gregs[REG_RIP];
-		if (!dladdr(faultIp, &dl))
+		uintptr_t pc = GetFaultPc(ucontext);
+		if (sig == SIGABRT || !hasForeignAction[i] || !IsForeignCode(i, pc) || !IsForeignActionMapped(i))
+			break;
+
+		// The handler keeps returning without fixing the fault, stop retrying it.
+		if (IsRepeatedFault(pc, info))
+			break;
+
+		// A runtime that handles the fault either never returns or redirects the context to its exception dispatch.
+		// A stale context from a handler that never returned is replaced here.
+		tlsForwardContext = ucontext;
+		tlsForwardFrame = frame;
+		tlsForwardDumped = false;
+
+		CallAction(foreignActions[i], sig, info, ucontext);
+
+		bool dumped = tlsForwardDumped;
+		tlsForwardContext = nullptr;
+		tlsForwardFrame = nullptr;
+
+		if (dumped || GetFaultPc(ucontext) != pc)
 		{
-			// Managed code: the runtime raises an exception, or chains to its previous handler itself.
-			clrSignalHandlers[i](sig, info, ucontext);
+			tlsRetryCount = 0;
 			return;
 		}
-		break;
+
+		// A runtime that gives up restores the default action and returns, the re-fault would kill us without a dump.
+		struct sigaction cur;
+		if (sigaction(sig, NULL, &cur) == 0 && (!(cur.sa_flags & SA_SIGINFO) || cur.sa_sigaction != AcceleratorSignalHandler))
+			break;
+
+		// Still ours: the handler may have fixed the cause, retry the instruction. IsRepeatedFault catches it otherwise.
+		RecordRetry(pc, info);
+		return;
 	}
 
 	SignalHandler(sig, info, ucontext);
@@ -1083,6 +1354,15 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 	}
 
 #if defined _LINUX
+	// A runtime that set up its handlers before us is displaced by breakpad, keep it so it still sees its faults.
+	struct sigaction preexisting;
+	for (int i = 0; i < kNumHandledSignals; ++i)
+	{
+		hasForeignAction[i] = false;
+		if (sigaction(kExceptionSignals[i], NULL, &preexisting) == 0 && IsForeignAction(preexisting))
+			RememberForeignAction(i, preexisting);
+	}
+
 	google_breakpad::MinidumpDescriptor descriptor(dumpStoragePath);
 	exceptionHandler = new google_breakpad::ExceptionHandler(descriptor, filterCallback, dumpCallback, NULL, true, -1);
 
@@ -1153,6 +1433,24 @@ bool AcceleratorCS2::Unload(char* error, size_t maxlen)
 
 	delete exceptionHandler;
 
+#if defined _LINUX
+	// Breakpad restored what it saw at Load, put back the handlers we displaced since then (e.g. a later CLR).
+	for (int i = 0; i < kNumHandledSignals; ++i)
+	{
+		if (hasForeignAction[i])
+		{
+			hasForeignAction[i] = false;
+
+			// Never install a pointer into a library that has been unloaded since.
+			Dl_info dl;
+			void* fn = (foreignActions[i].sa_flags & SA_SIGINFO) ? (void*)foreignActions[i].sa_sigaction : (void*)foreignActions[i].sa_handler;
+			bool mapped = foreignImages[i][0] ? dladdr(fn, &dl) && dl.dli_fname && BasenameMatches(dl.dli_fname, foreignImages[i]) : IsForeignActionMapped(i);
+			if (mapped)
+				sigaction(kExceptionSignals[i], &foreignActions[i], NULL);
+		}
+	}
+#endif
+
 	return true;
 }
 
@@ -1167,10 +1465,10 @@ KHook::Return<void> AcceleratorCS2::GameFrame(IServerGameDLL* pThis, bool simula
 	{
 		sigaction(kExceptionSignals[i], NULL, &oact);
 
-		if (oact.sa_sigaction != AcceleratorSignalHandler)
+		if (!(oact.sa_flags & SA_SIGINFO) || oact.sa_sigaction != AcceleratorSignalHandler)
 		{
-			if (IsClrSignalHandler(oact))
-				clrSignalHandlers[i] = oact.sa_sigaction;
+			if (IsForeignAction(oact))
+				RememberForeignAction(i, oact);
 
 			weHaveBeenFuckedOver = true;
 		}
