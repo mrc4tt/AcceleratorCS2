@@ -129,6 +129,13 @@ static bool ShouldSkipDump()
 	return g_IgnoreShutdownCrashes && g_ShuttingDown;
 }
 
+// exit() runs atexit handlers before library destructors, so crashes in the teardown that follows are skipped
+// even when the server stopped without a quit command, a stop signal or PreShutdown.
+static void OnProcessExit()
+{
+	g_ShuttingDown = 1;
+}
+
 static int CountRecentDumps()
 {
 	time_t cutoff = time(nullptr) - static_cast<time_t>(g_CrashLoopWindowMinutes) * 60;
@@ -619,9 +626,19 @@ static void CallAction(const struct sigaction& action, int sig, siginfo_t* info,
 	sigprocmask(SIG_SETMASK, &saved, NULL);
 }
 
+// kill/pkill or a panel's stop timeout: a signal sent by another process is the server being taken down,
+// not a fault in it. Our own abort()/raise() also has si_code <= 0 but carries our pid, so it is still dumped.
+static bool IsExternalSignal(const siginfo_t* info)
+{
+	return info && info->si_code <= 0 && info->si_pid != getpid();
+}
+
 static void AcceleratorSignalHandler(int sig, siginfo_t* info, void* ucontext)
 {
 	void* frame = __builtin_frame_address(0);
+
+	if (IsExternalSignal(info))
+		g_ShuttingDown = 1;
 
 	// The foreign handler did not recognise the fault and chained to its previous handler, which is us.
 	if (tlsForwardContext == ucontext && (uintptr_t)frame < (uintptr_t)tlsForwardFrame)
@@ -1389,6 +1406,7 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 	startupServerHook.Add(g_pNetworkServerService);
 	preShutdownHook.Add(g_pSource2Server);
 	dispatchConCommandHook.Add(g_pCVar);
+	atexit(OnProcessExit);
 
 	strncpy(crashCommandLine, CommandLine()->GetCmdLine(), sizeof(crashCommandLine) - 1);
 
