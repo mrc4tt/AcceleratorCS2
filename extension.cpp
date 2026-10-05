@@ -269,7 +269,7 @@ static void StripCommandLine(char* cmdLine)
 		if (tokenEnd > tokenStart && (*tokenStart == '+' || *tokenStart == '-') && *p && *p != '+' && *p != '-')
 		{
 			char name[128];
-			size_t len = std::min(static_cast<size_t>(tokenEnd - tokenStart), sizeof(name) - 1);
+			size_t len = (std::min)(static_cast<size_t>(tokenEnd - tokenStart), sizeof(name) - 1);
 			memcpy(name, tokenStart, len);
 			name[len] = '\0';
 
@@ -318,7 +318,7 @@ static void CollectEnvironmentSecrets()
 			continue;
 
 		char name[128];
-		size_t len = std::min(static_cast<size_t>(equals - *env), sizeof(name) - 1);
+		size_t len = (std::min)(static_cast<size_t>(equals - *env), sizeof(name) - 1);
 		memcpy(name, *env, len);
 		name[len] = '\0';
 		// Paths (SSH_AUTH_SOCK, XAUTHORITY, ...) aren't secrets, and scrubbing one could hit the
@@ -379,7 +379,7 @@ static void ScrubFile(int fd, char* buffer, size_t size)
 
 		// Keep the tail so a secret split across two reads is still found. It was already scrubbed,
 		// so nothing in it matches twice.
-		carry = std::min(length, kMaxSecretLength - 1);
+		carry = (std::min)(length, kMaxSecretLength - 1);
 		memmove(buffer, buffer + length - carry, carry);
 		bufferOffset += length - carry;
 	}
