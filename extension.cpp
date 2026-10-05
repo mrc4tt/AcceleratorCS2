@@ -51,6 +51,7 @@
 #include <entity2/entitysystem.h>
 #if defined WIN32
 #include <corecrt_io.h>
+#include <fcntl.h>
 #endif
 
 #include "presubmit.h"
@@ -210,13 +211,276 @@ static bool ContainsNoCase(const char* haystack, const char* needle)
 	return false;
 }
 
+// Commands, launch options and environment variables whose value must never end up in a dump or its
+// metadata, such as the GSLT passed with +sv_setsteamaccount (or STEAM_ACC / SRCDS_TOKEN in containers).
+static bool IsSensitiveName(const char* name)
+{
+	static const char* const kSensitive[] = { "pass", "rcon", "token", "key", "secret", "auth", "steamaccount", "steam_acc", "gslt" };
+
+	for (const char* word : kSensitive)
+	{
+		if (ContainsNoCase(name, word))
+			return true;
+	}
+	return false;
+}
+
+// Values collected at load that are scrubbed from every dump. Short values are skipped: they would
+// match unrelated bytes and corrupt the stack memory the stack walk depends on.
+constexpr int kMaxSecrets = 16;
+constexpr size_t kMinSecretLength = 8;
+constexpr size_t kMaxSecretLength = 128;
+char g_Secrets[kMaxSecrets][kMaxSecretLength];
+size_t g_SecretLengths[kMaxSecrets];
+int g_NumSecrets = 0;
+
+static void AddSecret(const char* value, size_t length)
+{
+	if (length < kMinSecretLength || length >= kMaxSecretLength || g_NumSecrets == kMaxSecrets)
+		return;
+
+	for (int i = 0; i < g_NumSecrets; ++i)
+	{
+		if (g_SecretLengths[i] == length && memcmp(g_Secrets[i], value, length) == 0)
+			return;
+	}
+
+	memcpy(g_Secrets[g_NumSecrets], value, length);
+	g_SecretLengths[g_NumSecrets] = length;
+	++g_NumSecrets;
+}
+
+// Removes every sensitive +command or -option together with its value, in place, remembering the
+// values as secrets. The value is only taken when it doesn't look like the next option, so value-less
+// flags don't eat their neighbour.
+static void StripCommandLine(char* cmdLine)
+{
+	char* out = cmdLine;
+	char* p = cmdLine;
+	while (*p)
+	{
+		char* tokenStart = p;
+		while (*p && *p != ' ' && *p != '\t')
+			++p;
+		char* tokenEnd = p;
+		while (*p == ' ' || *p == '\t')
+			++p;
+
+		if (tokenEnd > tokenStart && (*tokenStart == '+' || *tokenStart == '-') && *p && *p != '+' && *p != '-')
+		{
+			char name[128];
+			size_t len = std::min(static_cast<size_t>(tokenEnd - tokenStart), sizeof(name) - 1);
+			memcpy(name, tokenStart, len);
+			name[len] = '\0';
+
+			if (IsSensitiveName(name))
+			{
+				char* value = p;
+				if (*p == '"')
+				{
+					for (value = ++p; *p && *p != '"'; ++p) {}
+					AddSecret(value, p - value);
+					if (*p)
+						++p;
+				}
+				else
+				{
+					while (*p && *p != ' ' && *p != '\t')
+						++p;
+					AddSecret(value, p - value);
+				}
+				while (*p == ' ' || *p == '\t')
+					++p;
+				continue;
+			}
+		}
+
+		memmove(out, tokenStart, p - tokenStart);
+		out += p - tokenStart;
+	}
+
+	while (out > cmdLine && (out[-1] == ' ' || out[-1] == '\t'))
+		--out;
+	*out = '\0';
+}
+
+static void CollectEnvironmentSecrets()
+{
+#if defined _LINUX
+	char** env = environ;
+#else
+	char** env = _environ;
+#endif
+	for (; env && *env; ++env)
+	{
+		const char* equals = strchr(*env, '=');
+		if (!equals || equals == *env)
+			continue;
+
+		char name[128];
+		size_t len = std::min(static_cast<size_t>(equals - *env), sizeof(name) - 1);
+		memcpy(name, *env, len);
+		name[len] = '\0';
+		// Paths (SSH_AUTH_SOCK, XAUTHORITY, ...) aren't secrets, and scrubbing one could hit the
+		// module paths the stack walk needs.
+		const char* value = equals + 1;
+		bool isPath = value[0] == '/' || value[0] == '\\' || (value[0] && value[1] == ':');
+		if (!isPath && IsSensitiveName(name))
+			AddSecret(value, strlen(value));
+	}
+}
+
+#if defined _LINUX
+#define SCRUB_READ sys_read
+#define SCRUB_WRITE sys_write
+#define SCRUB_SEEK sys_lseek
+#else
+#define SCRUB_READ _read
+#define SCRUB_WRITE _write
+#define SCRUB_SEEK _lseeki64
+#endif
+
+// Overwrites every occurrence of a secret in the file with asterisks, keeping the file size so the
+// minidump stays valid. Uses raw syscalls and the caller's buffer, so it is safe in the crash handler.
+static void ScrubFile(int fd, char* buffer, size_t size)
+{
+	if (fd < 0 || g_NumSecrets == 0 || size < 2 * kMaxSecretLength)
+		return;
+
+	int64_t bufferOffset = 0;
+	size_t carry = 0;
+	for (;;)
+	{
+		auto n = SCRUB_READ(fd, buffer + carry, static_cast<unsigned int>(size - carry));
+		if (n <= 0)
+			break;
+
+		size_t length = carry + static_cast<size_t>(n);
+		bool dirty = false;
+		for (int s = 0; s < g_NumSecrets; ++s)
+		{
+			const char* secret = g_Secrets[s];
+			size_t secretLength = g_SecretLengths[s];
+			for (size_t i = 0; i + secretLength <= length; ++i)
+			{
+				if (buffer[i] == secret[0] && memcmp(buffer + i, secret, secretLength) == 0)
+				{
+					memset(buffer + i, '*', secretLength);
+					dirty = true;
+					i += secretLength - 1;
+				}
+			}
+		}
+
+		// Writing the whole window back leaves the file position where the next read continues.
+		if (dirty && (SCRUB_SEEK(fd, bufferOffset, SEEK_SET) != bufferOffset ||
+			SCRUB_WRITE(fd, buffer, static_cast<unsigned int>(length)) != static_cast<decltype(n)>(length)))
+			break;
+
+		// Keep the tail so a secret split across two reads is still found. It was already scrubbed,
+		// so nothing in it matches twice.
+		carry = std::min(length, kMaxSecretLength - 1);
+		memmove(buffer, buffer + length - carry, carry);
+		bufferOffset += length - carry;
+	}
+}
+
+static char g_CrashScrubBuffer[64 * 1024];
+
+static void ScrubCrashFile(const char* path)
+{
+#if defined _LINUX
+	int fd = sys_open(path, O_RDWR, 0);
+	ScrubFile(fd, g_CrashScrubBuffer, sizeof(g_CrashScrubBuffer));
+	if (fd >= 0)
+		sys_close(fd);
+#else
+	int fd = _open(path, _O_RDWR | _O_BINARY);
+	ScrubFile(fd, g_CrashScrubBuffer, sizeof(g_CrashScrubBuffer));
+	if (fd >= 0)
+		_close(fd);
+#endif
+}
+
+// Covers dumps written before the secrets were known to this version, or by a crash handler that
+// died before scrubbing.
+static void ScrubFileBeforeUpload(const std::filesystem::path& path)
+{
+	std::vector<char> buffer(256 * 1024);
+#if defined _LINUX
+	int fd = open(path.c_str(), O_RDWR);
+	ScrubFile(fd, buffer.data(), buffer.size());
+	if (fd >= 0)
+		close(fd);
+#else
+	int fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
+	ScrubFile(fd, buffer.data(), buffer.size());
+	if (fd >= 0)
+		_close(fd);
+#endif
+}
+
+#if defined _LINUX
+// Breakpad copies /proc/self/cmdline into every Linux minidump, which reads straight from the
+// process's original argv area. The engine works from its own copy of the command line, so sensitive
+// options and their values can be blanked there without affecting the server. This also hides short
+// values the dump scrub skips, and keeps them out of ps.
+static void MaskProcessArguments()
+{
+	FILE* stat = fopen("/proc/self/stat", "r");
+	if (!stat)
+		return;
+
+	char buffer[4096];
+	size_t length = fread(buffer, 1, sizeof(buffer) - 1, stat);
+	fclose(stat);
+	buffer[length] = '\0';
+
+	// Field 2 (comm) may contain spaces, so start counting after its closing parenthesis.
+	char* p = strrchr(buffer, ')');
+	if (!p)
+		return;
+
+	// p now points at field 3; arg_start and arg_end are fields 48 and 49.
+	unsigned long long argStart = 0, argEnd = 0;
+	for (int field = 2; field < 49 && p; ++field)
+	{
+		p = strchr(p + 1, ' ');
+		if (p && field + 1 == 48)
+			argStart = strtoull(p + 1, nullptr, 10);
+		else if (p && field + 1 == 49)
+			argEnd = strtoull(p + 1, nullptr, 10);
+	}
+	if (!argStart || argEnd <= argStart)
+		return;
+
+	char* arg = reinterpret_cast<char*>(argStart);
+	char* end = reinterpret_cast<char*>(argEnd);
+	char* sensitiveOption = nullptr;
+	while (arg < end)
+	{
+		size_t argLength = strnlen(arg, end - arg);
+		bool isOption = *arg == '+' || *arg == '-';
+		if (sensitiveOption && !isOption)
+		{
+			memset(sensitiveOption, 0, strlen(sensitiveOption));
+			memset(arg, 0, argLength);
+		}
+		sensitiveOption = isOption && IsSensitiveName(arg) ? arg : nullptr;
+		arg += argLength + 1;
+	}
+}
+#endif
+
 static void RecordCommand(const char* name, const CCommand& args)
 {
-	static const char* const kSensitive[] = { "pass", "rcon", "token", "key", "secret", "auth" };
-
-	bool sensitive = false;
-	for (const char* word : kSensitive)
-		sensitive = sensitive || ContainsNoCase(name, word);
+	bool sensitive = IsSensitiveName(name);
+	if (sensitive)
+	{
+		// e.g. sv_setsteamaccount run from server.cfg instead of the command line.
+		for (int i = 1; i < args.ArgC(); ++i)
+			AddSecret(args.Arg(i), strlen(args.Arg(i)));
+	}
 
 	int slot = g_CommandHistoryNext % kCommandHistorySize;
 	long uptime = static_cast<long>(time(nullptr) - g_LoadTime);
@@ -782,6 +1046,8 @@ static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
 	if (!succeeded)
 		return succeeded;
 
+	ScrubCrashFile(descriptor.path());
+
 	my_strlcpy(dumpStoragePath, descriptor.path(), sizeof(dumpStoragePath));
 	my_strlcat(dumpStoragePath, ".txt", sizeof(dumpStoragePath));
 
@@ -872,6 +1138,7 @@ static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
 	}
 
 	sys_close(extra);
+	ScrubCrashFile(dumpStoragePath);
 
 	return succeeded;
 }
@@ -959,6 +1226,8 @@ static bool dumpCallback(const wchar_t* dump_path,
 		return succeeded;
 	}
 
+	sprintf(dumpStoragePath, "%ls\\%ls.dmp", dump_path, minidump_id);
+	ScrubCrashFile(dumpStoragePath);
 	sprintf(dumpStoragePath, "%ls\\%ls.dmp.txt", dump_path, minidump_id);
 
 	FILE* extra = fopen(dumpStoragePath, "wb");
@@ -1011,6 +1280,7 @@ static bool dumpCallback(const wchar_t* dump_path,
 	}
 
 	fclose(extra);
+	ScrubCrashFile(dumpStoragePath);
 
 	return succeeded;
 }
@@ -1133,6 +1403,8 @@ void UploadThread()
 				continue;
 			}
 
+			ScrubFileBeforeUpload(uploadedPath);
+			ScrubFileBeforeUpload(metadataPath);
 			UploadDump(uploadedPath, metadataPath);
 		}
 	}
@@ -1408,7 +1680,14 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 	dispatchConCommandHook.Add(g_pCVar);
 	atexit(OnProcessExit);
 
-	strncpy(crashCommandLine, CommandLine()->GetCmdLine(), sizeof(crashCommandLine) - 1);
+	// Strip the full command line before truncating it, so a secret near the end is collected whole.
+	std::string commandLine = CommandLine()->GetCmdLine();
+	StripCommandLine(commandLine.data());
+	strncpy(crashCommandLine, commandLine.c_str(), sizeof(crashCommandLine) - 1);
+	CollectEnvironmentSecrets();
+#if defined _LINUX
+	MaskProcessArguments();
+#endif
 
 	if (late)
 		StartupServer(nullptr, {}, nullptr, nullptr);
