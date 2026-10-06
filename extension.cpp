@@ -215,7 +215,7 @@ static bool ContainsNoCase(const char* haystack, const char* needle)
 // metadata, such as the GSLT passed with +sv_setsteamaccount (or STEAM_ACC / SRCDS_TOKEN in containers).
 static bool IsSensitiveName(const char* name)
 {
-	static const char* const kSensitive[] = { "pass", "rcon", "token", "key", "secret", "auth", "steamaccount", "steam_acc", "gslt" };
+	static const char* const kSensitive[] = { "pass", "rcon", "token", "key", "secret", "auth", "steamaccount", "steam_acc", "gslt", "webhook", "discord" };
 
 	for (const char* word : kSensitive)
 	{
@@ -225,11 +225,25 @@ static bool IsSensitiveName(const char* name)
 	return false;
 }
 
+// Values that are secret whatever command or option carries them, such as a Discord webhook URL
+// passed to a plugin command with an innocent name.
+static bool IsSensitiveValue(const char* value)
+{
+	static const char* const kSensitive[] = { "/webhooks/", "hooks.slack.com/", "api.telegram.org/bot" };
+
+	for (const char* word : kSensitive)
+	{
+		if (ContainsNoCase(value, word))
+			return true;
+	}
+	return false;
+}
+
 // Values collected at load that are scrubbed from every dump. Short values are skipped: they would
 // match unrelated bytes and corrupt the stack memory the stack walk depends on.
 constexpr int kMaxSecrets = 16;
 constexpr size_t kMinSecretLength = 8;
-constexpr size_t kMaxSecretLength = 128;
+constexpr size_t kMaxSecretLength = 256;
 char g_Secrets[kMaxSecrets][kMaxSecretLength];
 size_t g_SecretLengths[kMaxSecrets];
 int g_NumSecrets = 0;
@@ -248,60 +262,68 @@ static void AddSecret(const char* value, size_t length)
 	memcpy(g_Secrets[g_NumSecrets], value, length);
 	g_SecretLengths[g_NumSecrets] = length;
 	++g_NumSecrets;
+
+	// The token at the end of a webhook URL can also sit in memory on its own.
+	const char* tail = value + length;
+	while (tail > value && tail[-1] != '/')
+		--tail;
+	if (tail > value)
+		AddSecret(tail, value + length - tail);
 }
 
-// Removes every sensitive +command or -option together with its value, in place, remembering the
-// values as secrets. The value is only taken when it doesn't look like the next option, so value-less
-// flags don't eat their neighbour.
-static void StripCommandLine(char* cmdLine)
+static constexpr const char* kMask = "*****";
+
+// Replaces the value of every sensitive +command or -option, and every value that is a secret on its
+// own, with asterisks, remembering the values as secrets. The value is only taken when it doesn't look
+// like the next option, so value-less flags don't eat their neighbour.
+static std::string MaskCommandLine(const std::string& cmdLine)
 {
-	char* out = cmdLine;
-	char* p = cmdLine;
+	std::string out;
+	const char* p = cmdLine.c_str();
+	bool maskNext = false;
 	while (*p)
 	{
-		char* tokenStart = p;
-		while (*p && *p != ' ' && *p != '\t')
-			++p;
-		char* tokenEnd = p;
 		while (*p == ' ' || *p == '\t')
 			++p;
+		if (!*p)
+			break;
 
-		if (tokenEnd > tokenStart && (*tokenStart == '+' || *tokenStart == '-') && *p && *p != '+' && *p != '-')
+		const char* tokenStart = p;
+		const char* valueStart = p;
+		const char* valueEnd;
+		if (*p == '"')
 		{
-			char name[128];
-			size_t len = (std::min)(static_cast<size_t>(tokenEnd - tokenStart), sizeof(name) - 1);
-			memcpy(name, tokenStart, len);
-			name[len] = '\0';
-
-			if (IsSensitiveName(name))
-			{
-				char* value = p;
-				if (*p == '"')
-				{
-					for (value = ++p; *p && *p != '"'; ++p) {}
-					AddSecret(value, p - value);
-					if (*p)
-						++p;
-				}
-				else
-				{
-					while (*p && *p != ' ' && *p != '\t')
-						++p;
-					AddSecret(value, p - value);
-				}
-				while (*p == ' ' || *p == '\t')
-					++p;
-				continue;
-			}
+			for (valueStart = ++p; *p && *p != '"'; ++p) {}
+			valueEnd = p;
+			if (*p)
+				++p;
+		}
+		else
+		{
+			while (*p && *p != ' ' && *p != '\t')
+				++p;
+			valueEnd = p;
 		}
 
-		memmove(out, tokenStart, p - tokenStart);
-		out += p - tokenStart;
-	}
+		std::string token(tokenStart, p - tokenStart);
+		std::string value(valueStart, valueEnd - valueStart);
+		bool isOption = *tokenStart == '+' || *tokenStart == '-';
 
-	while (out > cmdLine && (out[-1] == ' ' || out[-1] == '\t'))
-		--out;
-	*out = '\0';
+		if (!out.empty())
+			out += ' ';
+
+		if ((maskNext && !isOption) || (!isOption && IsSensitiveValue(value.c_str())))
+		{
+			AddSecret(value.c_str(), value.size());
+			out += kMask;
+			maskNext = false;
+			continue;
+		}
+
+		out += token;
+		maskNext = isOption && IsSensitiveName(token.c_str());
+	}
+	return out;
 }
 
 static void CollectEnvironmentSecrets()
@@ -461,11 +483,8 @@ static void MaskProcessArguments()
 	{
 		size_t argLength = strnlen(arg, end - arg);
 		bool isOption = *arg == '+' || *arg == '-';
-		if (sensitiveOption && !isOption)
-		{
-			memset(sensitiveOption, 0, strlen(sensitiveOption));
-			memset(arg, 0, argLength);
-		}
+		if (!isOption && (sensitiveOption || IsSensitiveValue(arg)))
+			memset(arg, '*', argLength);
 		sensitiveOption = isOption && IsSensitiveName(arg) ? arg : nullptr;
 		arg += argLength + 1;
 	}
@@ -475,6 +494,8 @@ static void MaskProcessArguments()
 static void RecordCommand(const char* name, const CCommand& args)
 {
 	bool sensitive = IsSensitiveName(name);
+	for (int i = 1; !sensitive && i < args.ArgC(); ++i)
+		sensitive = IsSensitiveValue(args.Arg(i));
 	if (sensitive)
 	{
 		// e.g. sv_setsteamaccount run from server.cfg instead of the command line.
@@ -485,7 +506,7 @@ static void RecordCommand(const char* name, const CCommand& args)
 	int slot = g_CommandHistoryNext % kCommandHistorySize;
 	long uptime = static_cast<long>(time(nullptr) - g_LoadTime);
 	if (sensitive)
-		V_snprintf(g_CommandHistory[slot], kCommandHistoryLength, "[+%lds] %s <args hidden>", uptime, name);
+		V_snprintf(g_CommandHistory[slot], kCommandHistoryLength, "[+%lds] %s %s", uptime, name, kMask);
 	else
 		V_snprintf(g_CommandHistory[slot], kCommandHistoryLength, "[+%lds] %s", uptime, args.GetCommandString());
 	g_CommandHistoryNext = (slot + 1) % kCommandHistorySize;
@@ -1680,9 +1701,8 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 	dispatchConCommandHook.Add(g_pCVar);
 	atexit(OnProcessExit);
 
-	// Strip the full command line before truncating it, so a secret near the end is collected whole.
-	std::string commandLine = CommandLine()->GetCmdLine();
-	StripCommandLine(commandLine.data());
+	// Mask the full command line before truncating it, so a secret near the end is collected whole.
+	std::string commandLine = MaskCommandLine(CommandLine()->GetCmdLine());
 	strncpy(crashCommandLine, commandLine.c_str(), sizeof(crashCommandLine) - 1);
 	CollectEnvironmentSecrets();
 #if defined _LINUX
