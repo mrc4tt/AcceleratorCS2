@@ -3,7 +3,7 @@
 #
 # Usage: scripts/build-linux.sh [steamrt3|steamrt4|all]   (default: all)
 #
-# Uses $HL2SDKCS2 / $MMSOURCE_DEV if set, otherwise clones hl2sdk (cs2) and metamod-source (master)
+# Uses $HL2SDKCS2 / $MMSOURCE_DEV if set, otherwise clones s2sdk (cs2) and metamod-source (master)
 # into .deps/. Packages end up in dist/<runtime>/.
 set -euo pipefail
 
@@ -26,7 +26,7 @@ SDK="${HL2SDKCS2:-$ROOT/.deps/hl2sdk-cs2}"
 MM="${MMSOURCE_DEV:-$ROOT/.deps/mmsource-2.0}"
 
 if [ ! -d "$SDK" ]; then
-	git clone --depth 1 -b cs2 https://github.com/alliedmodders/hl2sdk "$SDK"
+	git clone --depth 1 -b cs2 https://github.com/alliedmodders/s2sdk "$SDK"
 fi
 if [ ! -d "$MM" ]; then
 	git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/alliedmodders/metamod-source "$MM"
