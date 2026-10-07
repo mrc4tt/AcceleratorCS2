@@ -11,6 +11,7 @@ The configuration file is located at `AcceleratorCS2/config.json`.
 | `MinidumpAccountSteamId64` | `""` | Your steamid64. This allows you to view full details for your crash dumps on [Throttle](https://crash.limetech.org/). |
 | `UploadCrashDumps` | `false` | Upload dumps to Throttle at startup. When `false`, dumps are only kept in `addons/AcceleratorCS2/dumps`. |
 | `IgnoreShutdownCrashes` | `true` | Don't write a dump for crashes that happen after the server was told to stop (`quit`, `SIGTERM` from `docker stop`/Pterodactyl, Ctrl+C). These are teardown crashes, not real ones. |
+| `IgnoreFatalErrors` | `true` | Don't write a dump when the engine stops itself on purpose after a `FATAL ERROR` (e.g. `Error reading from loaded packed store` from a broken workshop VPK). The engine still exits, since it can't continue after a fatal error, but no `.dmp`/`.dmp.txt` is written. |
 | `CrashLoopMaxDumps` | `5` | Stop writing new dumps once this many were written within `CrashLoopWindowMinutes`, so a crash-looping server doesn't fill the disk. `0` disables. |
 | `CrashLoopWindowMinutes` | `10` | Window used by `CrashLoopMaxDumps`. |
 

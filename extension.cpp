@@ -67,6 +67,7 @@ std::string g_serverId;
 std::string g_UserId;
 bool g_UploadCrashDumps = false;
 bool g_IgnoreShutdownCrashes = true;
+bool g_IgnoreFatalErrors = true;
 
 // Crash-loop guard: once this many dumps were written within the window, stop writing new ones.
 // 0 in either value disables the guard.
@@ -82,6 +83,14 @@ int g_NumRecentDumps = 0;
 // Set once the server has been asked to stop (quit command, SIGTERM/SIGINT, engine shutdown).
 // Crashes after that point are teardown noise from a stop/restart, not real crashes.
 volatile sig_atomic_t g_ShuttingDown = 0;
+
+// Engine fatal errors (Plat_FatalError / Log_Error, e.g. "FATAL ERROR: Error reading from loaded packed store")
+// log at LS_ERROR and then deliberately terminate the process. That is the engine giving up on purpose, not a
+// crash, so the abort that follows is not dumped. The message is copied here when it is logged so the crash
+// handler only has to print it.
+constexpr time_t kFatalErrorWindowSeconds = 10;
+volatile time_t g_FatalErrorTime = 0;
+char g_FatalErrorMessage[512];
 
 // Extra context for the .dmp.txt. All of it is formatted ahead of time (at load, map start, or when a
 // command runs) so the crash handler only has to copy bytes.
@@ -129,6 +138,35 @@ static bool ShouldSkipDump()
 {
 	return g_IgnoreShutdownCrashes && g_ShuttingDown;
 }
+
+static bool IsEngineFatalError()
+{
+	time_t when = g_FatalErrorTime;
+	return g_IgnoreFatalErrors && when && time(nullptr) - when <= kFatalErrorWindowSeconds;
+}
+
+class FatalErrorListener : public ILoggingListener
+{
+public:
+	void Log(const LoggingContext_t* pContext, const tchar* pMessage) override
+	{
+		if (!pContext || pContext->m_Severity != LS_ERROR)
+			return;
+
+		size_t len = 0;
+		if (pMessage)
+		{
+			while (pMessage[len] && len < sizeof(g_FatalErrorMessage) - 1)
+				len++;
+			memcpy(g_FatalErrorMessage, pMessage, len);
+		}
+		while (len && (g_FatalErrorMessage[len - 1] == '\n' || g_FatalErrorMessage[len - 1] == '\r'))
+			len--;
+		g_FatalErrorMessage[len] = '\0';
+
+		g_FatalErrorTime = time(nullptr);
+	}
+} g_FatalErrorListener;
 
 // exit() runs atexit handlers before library destructors, so crashes in the teardown that follows are skipped
 // even when the server stopped without a quit command, a stop signal or PreShutdown.
@@ -1044,6 +1082,15 @@ static bool filterCallback(void* context)
 		return false;
 	}
 
+	if (IsEngineFatalError())
+	{
+		static const char msg[] = "Accelerator: engine fatal error, not writing minidump: ";
+		sys_write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+		sys_write(STDOUT_FILENO, g_FatalErrorMessage, my_strlen(g_FatalErrorMessage));
+		sys_write(STDOUT_FILENO, "\n", 1);
+		return false;
+	}
+
 	if (IsCrashLooping())
 	{
 		static const char msg[] = "Accelerator: crash loop detected (CrashLoopMaxDumps reached), not writing minidump\n";
@@ -1178,6 +1225,12 @@ static bool filterCallback(void* context, EXCEPTION_POINTERS* exinfo, MDRawAsser
 	if (ShouldSkipDump())
 	{
 		printf("Accelerator: crash during server shutdown, not writing minidump\n");
+		return false;
+	}
+
+	if (IsEngineFatalError())
+	{
+		printf("Accelerator: engine fatal error, not writing minidump: %s\n", g_FatalErrorMessage);
 		return false;
 	}
 
@@ -1615,6 +1668,11 @@ void LoadConfig()
 			g_IgnoreShutdownCrashes = config["IgnoreShutdownCrashes"].get<bool>();
 		}
 
+		// true: deliberate engine terminations (FATAL ERROR, e.g. a broken workshop VPK) are not dumped.
+		if (config.contains("IgnoreFatalErrors") && config["IgnoreFatalErrors"].is_boolean()) {
+			g_IgnoreFatalErrors = config["IgnoreFatalErrors"].get<bool>();
+		}
+
 		if (config.contains("CrashLoopMaxDumps") && config["CrashLoopMaxDumps"].is_number_integer()) {
 			g_CrashLoopMaxDumps = std::clamp(config["CrashLoopMaxDumps"].get<int>(), 0, kMaxRecentDumps);
 		}
@@ -1634,6 +1692,7 @@ void LoadConfig()
 		config["MinidumpAccountSteamId64"] = "";
 		config["UploadCrashDumps"] = false;
 		config["IgnoreShutdownCrashes"] = true;
+		config["IgnoreFatalErrors"] = true;
 		config["CrashLoopMaxDumps"] = 5;
 		config["CrashLoopWindowMinutes"] = 10;
 
@@ -1699,6 +1758,7 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 	startupServerHook.Add(g_pNetworkServerService);
 	preShutdownHook.Add(g_pSource2Server);
 	dispatchConCommandHook.Add(g_pCVar);
+	LoggingSystem_RegisterLoggingListener(&g_FatalErrorListener);
 	atexit(OnProcessExit);
 
 	// Mask the full command line before truncating it, so a secret near the end is collected whole.
@@ -1747,6 +1807,7 @@ bool AcceleratorCS2::Unload(char* error, size_t maxlen)
 	startupServerHook.Remove(g_pNetworkServerService);
 	preShutdownHook.Remove(g_pSource2Server);
 	dispatchConCommandHook.Remove(g_pCVar);
+	LoggingSystem_UnregisterLoggingListener(&g_FatalErrorListener);
 
 	delete exceptionHandler;
 
