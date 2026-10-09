@@ -10,6 +10,10 @@ class AcceleratorCS2 : public ISmmPlugin, public IMetamodListener
 public:
 	bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late);
 	bool Unload(char* error, size_t maxlen);
+	void AllPluginsLoaded();
+public: // IMetamodListener
+	void OnPluginLoad(PluginId id);
+	void OnPluginUnload(PluginId id);
 public:
 	const char* GetAuthor();
 	const char* GetName();
