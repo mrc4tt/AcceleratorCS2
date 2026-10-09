@@ -33,6 +33,7 @@
 #include <sstream>
 #include <cinttypes>
 #include <cctype>
+#include <atomic>
 
 #include "common/path_helper.h"
 #include "common/using_std_string.h"
@@ -55,6 +56,8 @@
 #endif
 
 #include "presubmit.h"
+#include "crash_analysis.h"
+#include "css_crash_context.h"
 
 AcceleratorCS2 g_AcceleratorCS2;
 PLUGIN_EXPOSE(AcceleratorCS2, g_AcceleratorCS2);
@@ -91,6 +94,23 @@ volatile sig_atomic_t g_ShuttingDown = 0;
 constexpr time_t kFatalErrorWindowSeconds = 10;
 volatile time_t g_FatalErrorTime = 0;
 char g_FatalErrorMessage[512];
+
+// Recent engine warnings and errors (from any system, e.g. the game's inventory code), formatted when logged
+// so the crash handler only copies them. Shows what the game complained about right before a crash.
+constexpr int kEngineMessageCount = 24;
+constexpr int kEngineMessageLength = 256;
+char g_EngineMessages[kEngineMessageCount][kEngineMessageLength];
+std::atomic<unsigned> g_EngineMessageNext{ 0 };
+
+// CounterStrikeSharp's crash flight recorder (css_crash_context.h): which plugin was running, recent plugin
+// activity, risky state changes. Found through Metamod, null with a CounterStrikeSharp that doesn't have it.
+const CssCrashContext* volatile g_CssContext = nullptr;
+
+// dumpStoragePath is reused for the path of the report being written, this keeps the folder.
+char g_DumpDirectory[512];
+
+// Rules that turn a report into a plain-language summary: built-in ones plus crash_rules.json.
+std::vector<crash_analysis::Rule> g_CrashRules;
 
 // Extra context for the .dmp.txt. All of it is formatted ahead of time (at load, map start, or when a
 // command runs) so the crash handler only has to copy bytes.
@@ -145,12 +165,40 @@ static bool IsEngineFatalError()
 	return g_IgnoreFatalErrors && when && time(nullptr) - when <= kFatalErrorWindowSeconds;
 }
 
+static void RecordEngineMessage(LoggingSeverity_t severity, const char* message)
+{
+	if (!message || !message[0])
+		return;
+
+	const char* label = severity >= LS_ERROR ? "ERROR" : severity == LS_ASSERT ? "ASSERT" : "WARNING";
+	long uptime = g_LoadTime ? static_cast<long>(time(nullptr) - g_LoadTime) : 0;
+
+	// Logging can happen on any thread, each one claims its own slot.
+	char* entry = g_EngineMessages[g_EngineMessageNext.fetch_add(1) % kEngineMessageCount];
+	V_snprintf(entry, kEngineMessageLength, "[+%lds] %s %s", uptime, label, message);
+
+	// One line per message.
+	size_t len = 0;
+	for (; entry[len]; ++len)
+	{
+		if (entry[len] == '\n' || entry[len] == '\r' || entry[len] == '\t')
+			entry[len] = ' ';
+	}
+	while (len && entry[len - 1] == ' ')
+		entry[--len] = '\0';
+}
+
 class FatalErrorListener : public ILoggingListener
 {
 public:
 	void Log(const LoggingContext_t* pContext, const tchar* pMessage) override
 	{
-		if (!pContext || pContext->m_Severity != LS_ERROR)
+		if (!pContext || pContext->m_Severity < LS_WARNING)
+			return;
+
+		RecordEngineMessage(pContext->m_Severity, pMessage);
+
+		if (pContext->m_Severity != LS_ERROR)
 			return;
 
 		size_t len = 0;
@@ -207,6 +255,134 @@ static const char* FormatUInt(char* buffer, uint64_t value)
 	return p;
 }
 
+static bool IsSensitiveName(const char* name);
+static bool IsSensitiveValue(const char* value);
+#if defined _LINUX
+static bool FindMapping(uintptr_t addr, bool* exec, char* path, size_t pathSize);
+#endif
+
+// The block may belong to a CounterStrikeSharp that was unloaded since, so check it is still mapped
+// before touching it. Signal-safe.
+static bool IsCssContextReadable(const CssCrashContext* context)
+{
+	if (!context)
+		return false;
+#if defined _LINUX
+	bool exec = false;
+	char path[8];
+	uintptr_t start = reinterpret_cast<uintptr_t>(context);
+	if (!FindMapping(start, &exec, path, sizeof(path)) || !FindMapping(start + sizeof(CssCrashContext) - 1, &exec, path, sizeof(path)))
+		return false;
+#endif
+	return context->magic == CSS_CRASH_CONTEXT_MAGIC && context->version == CSS_CRASH_CONTEXT_VERSION && context->size == sizeof(CssCrashContext);
+}
+
+// Copies a fixed-size field that another module wrote and may have torn: stops at the field size and
+// replaces control characters. Spaces become '_' when the value must stay one word (plugin, kind).
+static void CopyField(char* dest, const char* src, size_t fieldSize, bool oneWord)
+{
+	size_t i = 0;
+	for (; i < fieldSize - 1 && src[i]; ++i)
+	{
+		unsigned char c = static_cast<unsigned char>(src[i]);
+		dest[i] = c < 0x20 || c == 0x7f ? '?' : (oneWord && c == ' ' ? '_' : static_cast<char>(c));
+	}
+	dest[i] = '\0';
+}
+
+// "  [+1040s] IdentitySpoofer command: CSs_spoof @me 7656..." (read back by crash_analysis).
+template <typename Write>
+static void WriteCssEntry(Write write, const CssCrashEntry& entry, bool withTime)
+{
+	char number[21];
+	char plugin[CSS_CRASH_PLUGIN_LENGTH];
+	char kind[CSS_CRASH_KIND_LENGTH];
+	char detail[CSS_CRASH_DETAIL_LENGTH];
+	CopyField(plugin, entry.plugin, sizeof(plugin), true);
+	CopyField(kind, entry.kind, sizeof(kind), true);
+	CopyField(detail, entry.detail, sizeof(detail), false);
+
+	// Command arguments get the same masking as the console command history.
+	if ((!strcmp(kind, "command") || !strcmp(kind, "cmdlistener")) && (IsSensitiveName(detail) || IsSensitiveValue(detail)))
+	{
+		char* end = strchr(detail, ' ');
+		if (!end)
+			end = detail + strlen(detail);
+		static const char kMasked[] = " *****";
+		if (end + sizeof(kMasked) > detail + sizeof(detail))
+			end = detail + sizeof(detail) - sizeof(kMasked);
+		memcpy(end, kMasked, sizeof(kMasked));
+	}
+
+	write("  ");
+	if (withTime)
+	{
+		int64_t seconds = entry.unixMs / 1000 - static_cast<int64_t>(g_LoadTime);
+		write("[+");
+		write(FormatUInt(number, seconds > 0 ? static_cast<uint64_t>(seconds) : 0));
+		write("s] ");
+	}
+	write(plugin[0] ? plugin : "?");
+	write(" ");
+	write(kind[0] ? kind : "?");
+	write(": ");
+	write(detail);
+	write("\n");
+}
+
+template <typename Write>
+static void WriteCssRing(Write write, const char* header, const CssCrashEntry* ring, uint32_t size, uint32_t next)
+{
+	write(header);
+	write("\n");
+	bool any = false;
+	for (uint32_t i = 0; i < size; ++i)
+	{
+		const CssCrashEntry& entry = ring[(next + i) % size];
+		if (!entry.unixMs)
+			continue;
+		WriteCssEntry(write, entry, true);
+		any = true;
+	}
+	if (!any)
+		write("  (none)\n");
+}
+
+template <typename Write>
+static void WriteCssContext(Write write)
+{
+	const CssCrashContext* context = g_CssContext;
+	if (!IsCssContextReadable(context))
+		return;
+
+	write(crash_analysis::kCssCurrentHeader);
+	write("\n");
+	uint32_t depth = context->depth;
+	if (depth > CSS_CRASH_MAX_DEPTH)
+		depth = CSS_CRASH_MAX_DEPTH;
+	for (uint32_t i = 0; i < depth; ++i)
+		WriteCssEntry(write, context->current[i], false);
+	if (!depth)
+		write("  (none)\n");
+
+	WriteCssRing(write, crash_analysis::kCssActivityHeader, context->activity, CSS_CRASH_ACTIVITY_SIZE, context->activityNext % CSS_CRASH_ACTIVITY_SIZE);
+	WriteCssRing(write, crash_analysis::kCssJournalHeader, context->journal, CSS_CRASH_JOURNAL_SIZE, context->journalNext % CSS_CRASH_JOURNAL_SIZE);
+	WriteCssRing(write, crash_analysis::kCssExceptionsHeader, context->exceptions, CSS_CRASH_EXCEPTION_SIZE, context->exceptionNext % CSS_CRASH_EXCEPTION_SIZE);
+}
+
+template <typename Write>
+static void WriteConfigBlock(Write write)
+{
+	write("-------- CONFIG BEGIN --------");
+	write("\nMap=");
+	write(crashMap);
+	write("\nGamePath=");
+	write(crashGamePath);
+	write("\nCommandLine=");
+	write(crashCommandLine);
+	write("\n-------- CONFIG END --------\n\n");
+}
+
 // Runs inside the crash handler: only reads pre-formatted buffers, no allocation.
 template <typename Write>
 static void WriteCrashContext(Write write)
@@ -232,6 +408,34 @@ static void WriteCrashContext(Write write)
 		write(entry);
 		write("\n");
 	}
+
+	write(crash_analysis::kEngineMessagesHeader);
+	write("\n");
+	bool anyMessage = false;
+	unsigned nextMessage = g_EngineMessageNext.load();
+	for (int i = 0; i < kEngineMessageCount; ++i)
+	{
+		const char* entry = g_EngineMessages[(nextMessage + i) % kEngineMessageCount];
+		if (!entry[0])
+			continue;
+		write("  ");
+		write(entry);
+		write("\n");
+		anyMessage = true;
+	}
+	if (!anyMessage)
+		write("  (none)\n");
+
+	// Independent of IgnoreFatalErrors: the error that made the engine stop is the most useful line here.
+	time_t fatalTime = g_FatalErrorTime;
+	if (fatalTime && time(nullptr) - fatalTime <= kFatalErrorWindowSeconds)
+	{
+		write(crash_analysis::kEngineFatalPrefix);
+		write(g_FatalErrorMessage);
+		write("\n");
+	}
+
+	WriteCssContext(write);
 	write("-------- CONTEXT END --------\n\n");
 }
 
@@ -478,6 +682,46 @@ static void ScrubFileBeforeUpload(const std::filesystem::path& path)
 	if (fd >= 0)
 		_close(fd);
 #endif
+}
+
+// Same masking as ScrubFile, for text printed to the console.
+static void ScrubString(std::string& text)
+{
+	for (int s = 0; s < g_NumSecrets; ++s)
+	{
+		const std::string secret(g_Secrets[s], g_SecretLengths[s]);
+		for (size_t pos = text.find(secret); pos != std::string::npos; pos = text.find(secret, pos + secret.size()))
+			text.replace(pos, secret.size(), secret.size(), '*');
+	}
+}
+
+// Puts a plain-language CRASH SUMMARY (see crash_analysis.h) at the top of a finished report and returns it,
+// scrubbed, for printing. Empty if the report already has one or can't be read. Allocates: in the crash
+// handler it only runs after the stack walk, which allocates already.
+static std::string AddSummaryToReport(const std::filesystem::path& path)
+{
+	std::string content;
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (!in)
+			return std::string();
+		std::ostringstream buffer;
+		buffer << in.rdbuf();
+		content = buffer.str();
+	}
+	if (content.empty() || crash_analysis::HasSummary(content))
+		return std::string();
+
+	std::string summary = crash_analysis::BuildSummary(content, g_CrashRules);
+	{
+		std::ofstream out(path, std::ios::binary | std::ios::trunc);
+		if (!out)
+			return std::string();
+		out << summary << content;
+	}
+	ScrubFileBeforeUpload(path);
+	ScrubString(summary);
+	return summary;
 }
 
 #if defined _LINUX
@@ -1073,6 +1317,40 @@ static void RemoveShutdownSignalHandlers()
 	}
 }
 
+// fatal-<unixtime>.txt in the dumps folder: CONFIG, CONTEXT and a summary, without a minidump. A fatal
+// error is often caused by a plugin (e.g. a spoofed SteamID breaking the game's inventory code), so the
+// owner still gets told why the server stopped.
+static void WriteFatalErrorReport()
+{
+	char number[21];
+	char path[sizeof(g_DumpDirectory) + 64];
+	my_strlcpy(path, g_DumpDirectory, sizeof(path));
+	my_strlcat(path, "/fatal-", sizeof(path));
+	my_strlcat(path, FormatUInt(number, static_cast<uint64_t>(time(nullptr))), sizeof(path));
+	my_strlcat(path, ".txt", sizeof(path));
+
+	int fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		return;
+
+	auto write = [fd](const char* text) { sys_write(fd, text, my_strlen(text)); };
+	write("-------- FATAL ERROR REPORT --------\n");
+	write("The game stopped itself on purpose after an engine error, no minidump was written (IgnoreFatalErrors).\n\n");
+	WriteConfigBlock(write);
+	WriteCrashContext(write);
+	sys_close(fd);
+	ScrubCrashFile(path);
+
+	static const char wrote[] = "Accelerator: wrote fatal error report to: ";
+	sys_write(STDOUT_FILENO, wrote, sizeof(wrote) - 1);
+	sys_write(STDOUT_FILENO, path, my_strlen(path));
+	sys_write(STDOUT_FILENO, "\n", 1);
+
+	// The engine is stopping on purpose, the heap is intact. If this fails anyway, the next start adds it.
+	std::string summary = AddSummaryToReport(path);
+	sys_write(STDOUT_FILENO, summary.data(), summary.size());
+}
+
 static bool filterCallback(void* context)
 {
 	if (ShouldSkipDump())
@@ -1088,6 +1366,7 @@ static bool filterCallback(void* context)
 		sys_write(STDOUT_FILENO, msg, sizeof(msg) - 1);
 		sys_write(STDOUT_FILENO, g_FatalErrorMessage, my_strlen(g_FatalErrorMessage));
 		sys_write(STDOUT_FILENO, "\n", 1);
+		WriteFatalErrorReport();
 		return false;
 	}
 
@@ -1126,20 +1405,14 @@ static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
 		return succeeded;
 	}
 
-	sys_write(extra, "-------- CONFIG BEGIN --------", 30);
-	sys_write(extra, "\nMap=", 5);
-	sys_write(extra, crashMap, my_strlen(crashMap));
-	sys_write(extra, "\nGamePath=", 10);
-	sys_write(extra, crashGamePath, my_strlen(crashGamePath));
-	sys_write(extra, "\nCommandLine=", 13);
-	sys_write(extra, crashCommandLine, my_strlen(crashCommandLine));
-	sys_write(extra, "\n-------- CONFIG END --------\n", 30);
-	sys_write(extra, "\n", 1);
-
-	WriteCrashContext([extra](const char* text) { sys_write(extra, text, my_strlen(text)); });
+	auto writeExtra = [extra](const char* text) { sys_write(extra, text, my_strlen(text)); };
+	WriteConfigBlock(writeExtra);
+	WriteCrashContext(writeExtra);
 
 	// Everything below allocates. After heap corruption (glibc "double free or corruption" aborts)
 	// it can fail, the stack walk is then filled in on the next start by RepairIncompleteMetadata().
+	int consoleFd = -1;
+	bool walked = false;
 	google_breakpad::scoped_ptr<google_breakpad::SimpleSymbolSupplier> symbolSupplier;
 	google_breakpad::BasicSourceLineResolver resolver;
 	google_breakpad::MinidumpProcessor minidump_processor(symbolSupplier.get(), &resolver);
@@ -1197,16 +1470,28 @@ static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
 
 			//sys_write(STDOUT_FILENO, stream.str().c_str(), stream.str().length());
 
+			// stdout becomes the report file below, keep the console to print the summary on.
+			consoleFd = dup(STDOUT_FILENO);
 			freopen(dumpStoragePath, "a", stdout);
 			PrintProcessState(processState, true, false, &resolver);
 			if (stack->frames()->size() > 0)
 				WriteInstructionBytes(stdout, miniDump, stack->frames()->at(0)->instruction);
 			fflush(stdout);
+			walked = true;
 		}
 	}
 
 	sys_close(extra);
 	ScrubCrashFile(dumpStoragePath);
+
+	// Without a stack walk the summary is added on the next start, together with the walk.
+	if (walked)
+	{
+		std::string summary = AddSummaryToReport(dumpStoragePath);
+		int out = consoleFd >= 0 ? consoleFd : STDOUT_FILENO;
+		sys_write(out, "\n", 1);
+		sys_write(out, summary.data(), summary.size());
+	}
 
 	return succeeded;
 }
@@ -1220,6 +1505,28 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType)
 	return FALSE;
 }
 
+// fatal-<unixtime>.txt in the dumps folder, see the Linux version.
+static void WriteFatalErrorReport()
+{
+	char path[sizeof(g_DumpDirectory) + 64];
+	snprintf(path, sizeof(path), "%s\\fatal-%lld.txt", g_DumpDirectory, static_cast<long long>(time(nullptr)));
+
+	FILE* out = fopen(path, "wb");
+	if (!out)
+		return;
+
+	auto write = [out](const char* text) { fputs(text, out); };
+	write("-------- FATAL ERROR REPORT --------\n");
+	write("The game stopped itself on purpose after an engine error, no minidump was written (IgnoreFatalErrors).\n\n");
+	WriteConfigBlock(write);
+	WriteCrashContext(write);
+	fclose(out);
+	ScrubCrashFile(path);
+
+	printf("Accelerator: wrote fatal error report to: %s\n", path);
+	printf("%s", AddSummaryToReport(path).c_str());
+}
+
 static bool filterCallback(void* context, EXCEPTION_POINTERS* exinfo, MDRawAssertionInfo* assertion)
 {
 	if (ShouldSkipDump())
@@ -1231,6 +1538,7 @@ static bool filterCallback(void* context, EXCEPTION_POINTERS* exinfo, MDRawAsser
 	if (IsEngineFatalError())
 	{
 		printf("Accelerator: engine fatal error, not writing minidump: %s\n", g_FatalErrorMessage);
+		WriteFatalErrorReport();
 		return false;
 	}
 
@@ -1310,15 +1618,13 @@ static bool dumpCallback(const wchar_t* dump_path,
 		return succeeded;
 	}
 
-	fprintf(extra, "-------- CONFIG BEGIN --------");
-	fprintf(extra, "\nMap=%s", crashMap);
-	fprintf(extra, "\nGamePath=%s", crashGamePath);
-	fprintf(extra, "\nCommandLine=%s", crashCommandLine);
-	fprintf(extra, "\n-------- CONFIG END --------\n");
-	fprintf(extra, "\n");
-
-	WriteCrashContext([extra](const char* text) { fputs(text, extra); });
+	auto writeExtra = [extra](const char* text) { fputs(text, extra); };
+	WriteConfigBlock(writeExtra);
+	WriteCrashContext(writeExtra);
 	fflush(extra);
+
+	int consoleFd = -1;
+	bool walked = false;
 
 	google_breakpad::scoped_ptr<google_breakpad::SimpleSymbolSupplier> symbolSupplier;
 	google_breakpad::BasicSourceLineResolver resolver;
@@ -1344,17 +1650,27 @@ static bool dumpCallback(const wchar_t* dump_path,
 		}
 		else
 		{
+			// stdout becomes the report file below, keep the console to print the summary on.
+			consoleFd = _dup(_fileno(stdout));
 			freopen(dumpStoragePath, "a", stdout);
 			PrintProcessState(processState, true, false, &resolver);
 			int requestingThread = processState.requesting_thread();
 			if (requestingThread >= 0 && !processState.threads()->at(requestingThread)->frames()->empty())
 				WriteInstructionBytes(stdout, miniDump, processState.threads()->at(requestingThread)->frames()->at(0)->instruction);
 			fflush(stdout);
+			walked = true;
 		}
 	}
 
 	fclose(extra);
 	ScrubCrashFile(dumpStoragePath);
+
+	if (walked)
+	{
+		std::string summary = AddSummaryToReport(dumpStoragePath);
+		if (consoleFd >= 0)
+			_write(consoleFd, summary.data(), static_cast<unsigned int>(summary.size()));
+	}
 
 	return succeeded;
 }
@@ -1563,12 +1879,113 @@ static void RepairIncompleteMetadata()
 	std::clog.rdbuf(savedClog);
 }
 
+static bool IsReportFile(const std::filesystem::path& path)
+{
+	const std::string name = path.filename().string();
+	auto endsWith = [&name](const char* suffix) {
+		size_t len = strlen(suffix);
+		return name.size() >= len && name.compare(name.size() - len, len, suffix) == 0;
+	};
+	return endsWith(".dmp.txt") || (name.rfind("fatal-", 0) == 0 && endsWith(".txt"));
+}
+
+// Reports written before this version, or whose summary could not be made in the crash handler.
+static void AddMissingSummaries()
+{
+	std::error_code ec;
+	for (std::filesystem::directory_iterator it(g_DumpDirectory, ec), end; !ec && it != end; it.increment(ec))
+	{
+		const std::filesystem::path& path = it->path();
+		if (!IsReportFile(path))
+			continue;
+		// A .dmp.txt without a stack walk is still waiting for RepairIncompleteMetadata.
+		if (path.filename().string().rfind("fatal-", 0) != 0 && !HasStackwalk(path))
+			continue;
+		if (!AddSummaryToReport(path).empty())
+			ConMsg("Accelerator: added crash summary to %s\n", path.string().c_str());
+	}
+}
+
+// Prints the summary of the newest report once, on the first start after the crash, so the owner sees
+// why the server went down without opening the dumps folder.
+static void ShowLatestSummary()
+{
+	std::error_code ec;
+	std::filesystem::path newest;
+	std::filesystem::file_time_type newestTime;
+	std::vector<std::filesystem::path> reports;
+	for (std::filesystem::directory_iterator it(g_DumpDirectory, ec), end; !ec && it != end; it.increment(ec))
+	{
+		if (!IsReportFile(it->path()))
+			continue;
+		reports.push_back(it->path());
+		std::error_code timeError;
+		auto time = std::filesystem::last_write_time(it->path(), timeError);
+		if (!timeError && (newest.empty() || time > newestTime))
+		{
+			newest = it->path();
+			newestTime = time;
+		}
+	}
+	if (newest.empty())
+		return;
+
+	const std::filesystem::path marker = std::filesystem::path(g_DumpDirectory) / ".last_shown_summary";
+	std::string shown;
+	{
+		std::ifstream in(marker);
+		std::getline(in, shown);
+	}
+	if (shown == newest.filename().string())
+		return;
+
+	auto readFile = [](const std::filesystem::path& path) {
+		std::ifstream in(path, std::ios::binary);
+		std::ostringstream buffer;
+		buffer << in.rdbuf();
+		return buffer.str();
+	};
+	std::string content = readFile(newest);
+	if (!crash_analysis::HasSummary(content))
+		return;
+
+	std::string summary = content.substr(0, content.find(crash_analysis::kSummaryEnd));
+	summary += crash_analysis::kSummaryEnd;
+
+	// How often the same cause shows up among the reports still on disk.
+	std::string signature = crash_analysis::GetSignature(content);
+	int same = 0;
+	if (!signature.empty())
+	{
+		for (const auto& report : reports)
+		{
+			std::string head = readFile(report).substr(0, 8192);
+			if (crash_analysis::GetSignature(head) == signature)
+				++same;
+		}
+	}
+
+	ConMsg("\nAccelerator: the server crashed last time. Report: %s\n", newest.string().c_str());
+	// ConMsg formats into a fixed buffer, print line by line.
+	std::istringstream lines(summary);
+	for (std::string line; std::getline(lines, line);)
+		ConMsg("%s\n", line.c_str());
+	if (same > 1)
+		ConMsg("Accelerator: %d of the %d reports in the dumps folder have this same cause.\n", same, static_cast<int>(reports.size()));
+	ConMsg("\n");
+
+	std::ofstream out(marker, std::ios::trunc);
+	out << newest.filename().string() << "\n";
+}
+
 // Same no-throw rules as UploadThread: this is a detached thread.
 void DumpMaintenanceThread()
 {
 	try
 	{
 		RepairIncompleteMetadata();
+		AddMissingSummaries();
+		ShowLatestSummary();
 	}
 	catch (const std::exception& e)
 	{
@@ -1643,6 +2060,43 @@ void LoadServerId()
 	}
 };
 
+// Optional addons/AcceleratorCS2/crash_rules.json: extra rules for the crash summary, tried before the
+// built-in ones. See crash_analysis.h for the format.
+static void LoadCrashRules()
+{
+	std::string rulesJson;
+	std::string rulesPath = std::string(crashGamePath) + "/addons/AcceleratorCS2/crash_rules.json";
+	std::ifstream rulesFile(rulesPath, std::ios::binary);
+	if (rulesFile.is_open())
+	{
+		std::ostringstream buffer;
+		buffer << rulesFile.rdbuf();
+		rulesJson = buffer.str();
+	}
+
+	std::string error;
+	g_CrashRules = crash_analysis::LoadRules(rulesJson, &error);
+	if (!error.empty())
+		ConMsg("Accelerator: ignoring %s: %s\n", rulesPath.c_str(), error.c_str());
+}
+
+// CounterStrikeSharp answers this through OnMetamodQuery once it is loaded. Plugins load in any order,
+// so this is retried when plugins load and on every map start.
+static void FindCssCrashContext()
+{
+	int ret = 0;
+	auto context = static_cast<const CssCrashContext*>(g_SMAPI->MetaFactory(CSS_CRASH_CONTEXT_INTERFACE, &ret, nullptr));
+	if (context && (context->magic != CSS_CRASH_CONTEXT_MAGIC || context->version != CSS_CRASH_CONTEXT_VERSION || context->size != sizeof(CssCrashContext)))
+	{
+		ConMsg("Accelerator: CounterStrikeSharp crash recorder has a different version, plugin activity will not be recorded\n");
+		context = nullptr;
+	}
+
+	if (context && !g_CssContext)
+		ConMsg("Accelerator: CounterStrikeSharp crash recorder found, crash reports will name plugins\n");
+	g_CssContext = context;
+}
+
 void LoadConfig()
 {
 	// load json config
@@ -1714,6 +2168,7 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 
 	strncpy(crashGamePath, ismm->GetBaseDir(), sizeof(crashGamePath) - 1);
 	ismm->Format(dumpStoragePath, sizeof(dumpStoragePath), "%s/addons/AcceleratorCS2/dumps", ismm->GetBaseDir());
+	strncpy(g_DumpDirectory, dumpStoragePath, sizeof(g_DumpDirectory) - 1);
 
 	std::error_code dumpDirError;
 	std::filesystem::create_directories(dumpStoragePath, dumpDirError);
@@ -1760,6 +2215,7 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 	dispatchConCommandHook.Add(g_pCVar);
 	LoggingSystem_RegisterLoggingListener(&g_FatalErrorListener);
 	atexit(OnProcessExit);
+	ismm->AddListener(this, this);
 
 	// Mask the full command line before truncating it, so a secret near the end is collected whole.
 	std::string commandLine = MaskCommandLine(CommandLine()->GetCmdLine());
@@ -1776,8 +2232,10 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 
 	LoadServerId();
 	LoadConfig();
+	LoadCrashRules();
 	LoadRecentDumps();
 	BuildPluginList();
+	FindCssCrashContext();
 
 	if (IsCrashLooping())
 	{
@@ -1794,6 +2252,23 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 	std::thread(DumpMaintenanceThread).detach();
 
 	return true;
+}
+
+void AcceleratorCS2::AllPluginsLoaded()
+{
+	FindCssCrashContext();
+}
+
+void AcceleratorCS2::OnPluginLoad(PluginId id)
+{
+	FindCssCrashContext();
+}
+
+// The recorder lives in CounterStrikeSharp's memory, never keep a pointer into an unloaded plugin.
+void AcceleratorCS2::OnPluginUnload(PluginId id)
+{
+	g_CssContext = nullptr;
+	FindCssCrashContext();
 }
 
 bool AcceleratorCS2::Unload(char* error, size_t maxlen)
@@ -1879,6 +2354,7 @@ KHook::Return<void> AcceleratorCS2::StartupServer(INetworkServerService* pThis, 
 
 	// Plugins can be added or hot-reloaded between maps.
 	BuildPluginList();
+	FindCssCrashContext();
 
 	return {KHook::Action::Ignore};
 }
@@ -1911,7 +2387,7 @@ const char* AcceleratorCS2::GetLicense()
 
 const char* AcceleratorCS2::GetVersion()
 {
-	return "3.8";
+	return "3.9";
 }
 
 const char* AcceleratorCS2::GetDate()
