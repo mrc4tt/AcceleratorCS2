@@ -126,11 +126,6 @@ volatile sig_atomic_t g_CommandHistoryNext = 0;
 // isn't retried on every boot.
 static const char kStackwalkFailedMarker[] = "-------- STACKWALK FAILED --------";
 
-CGameEntitySystem *GameEntitySystem()
-{
-	return nullptr;
-}
-
 class GameSessionConfiguration_t { };
 #if defined _LINUX
 KHook::Virtual<IServerGameDLL, void, bool, bool, bool> gameFrameHook(&IServerGameDLL::GameFrame, &g_AcceleratorCS2, nullptr, &AcceleratorCS2::GameFrame);
