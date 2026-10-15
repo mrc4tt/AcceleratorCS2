@@ -43,8 +43,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: alliedmodders/s2sdk
-          # Pinned: s2sdk is mid-restructure (eiface.h/iserver.h removed) and Metamod can't build against cs2 HEAD yet.
-          ref: 2ec7870724f979e6ee326522e941abc35907ee6b
+          ref: cs2
           path: hl2sdk-cs2
 
       - name: Install Premake5

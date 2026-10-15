@@ -26,9 +26,7 @@ SDK="${HL2SDKCS2:-$ROOT/.deps/hl2sdk-cs2}"
 MM="${MMSOURCE_DEV:-$ROOT/.deps/mmsource-2.0}"
 
 if [ ! -d "$SDK" ]; then
-	# Same pinned commit as .github/workflows (s2sdk cs2 HEAD is mid-restructure).
-	git clone -b cs2 https://github.com/alliedmodders/s2sdk "$SDK"
-	git -C "$SDK" checkout -q 2ec7870724f979e6ee326522e941abc35907ee6b
+	git clone --depth 1 -b cs2 https://github.com/alliedmodders/s2sdk "$SDK"
 fi
 if [ ! -d "$MM" ]; then
 	git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/alliedmodders/metamod-source "$MM"
