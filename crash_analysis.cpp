@@ -505,8 +505,9 @@ std::string GetSignature(const std::string& report)
 	return Trim(report.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
 }
 
-std::string BuildSummary(const std::string& text, const std::vector<Rule>& rules)
+Summary Analyze(const std::string& text, const std::vector<Rule>& rules)
 {
+	Summary result;
 	try
 	{
 		Report report = Parse(text);
@@ -653,48 +654,119 @@ std::string BuildSummary(const std::string& text, const std::vector<Rule>& rules
 			}
 		}
 
-		std::ostringstream out;
-		out << kSummaryBegin << "\n";
-		out << "Verdict:    " << verdict << "\n";
-		out << "Confidence: " << confidence << "\n";
-		out << "What:       " << title << "\n";
-		if (report.uptime >= 0)
-			out << "Uptime:     " << report.uptime / 60 << "m" << report.uptime % 60 << "s\n";
-		out << "\nWhat happened:\n";
-		Wrap(out, explanation, "  ");
-		if (!evidence.empty())
-		{
-			out << "\nEvidence:\n";
-			for (const std::string& e : evidence)
-				out << "  " << e << "\n";
-		}
-		if (!suspect.plugin.empty())
-		{
-			std::string info = PluginInfo(report, suspect.plugin);
-			if (!info.empty())
-				out << "\nPlugin:     " << info << "\n";
-		}
-		if (!advice.empty())
-		{
-			out << "\nWhat to do:\n";
-			for (size_t i = 0; i < advice.size(); ++i)
-			{
-				std::ostringstream item;
-				Wrap(item, advice[i], "     ");
-				std::string text = item.str();
-				out << "  " << (i + 1) << "." << text.substr(4);
-			}
-		}
-		if (report.cssCurrent.empty() && report.cssActivity.empty() && report.cssJournal.empty())
-			out << "\nNote: no CounterStrikeSharp activity was recorded (CounterStrikeSharp without the crash\n      recorder, or not installed), so plugins can only be blamed from the game error.\n";
-		out << "\n" << kSignaturePrefix << signature << "\n";
-		out << kSummaryEnd << "\n\n";
-		return out.str();
+		// A rule that blames a plugin counts as "plugin" even when it could not tell which one.
+		std::string cause = "unknown";
+		if (matched)
+			cause = matched->pluginCause ? "plugin" : "not_plugin";
+		else if (!suspect.plugin.empty())
+			cause = "plugin";
+		else if (!thirdPartyModule.empty() && !running)
+			cause = "module";
+
+		result.verdict = verdict;
+		result.cause = cause;
+		result.plugin = suspect.plugin;
+		result.module = thirdPartyModule.substr(0, thirdPartyModule.find(" + "));
+		result.confidence = confidence;
+		result.title = title;
+		result.explanation = explanation;
+		result.advice = advice;
+		result.evidence = evidence;
+		result.signature = signature;
+		result.uptime = report.uptime;
+		result.pluginInfo = suspect.plugin.empty() ? std::string() : PluginInfo(report, suspect.plugin);
+		result.cssRecorded = !(report.cssCurrent.empty() && report.cssActivity.empty() && report.cssJournal.empty());
 	}
 	catch (...)
 	{
-		return std::string(kSummaryBegin) + "\nVerdict:    Cause: unknown (analysis failed)\n" + kSummaryEnd + "\n\n";
+		result = Summary();
+		result.verdict = "Cause: unknown (analysis failed)";
+		result.failed = true;
 	}
+	return result;
+}
+
+std::string FormatSummary(const Summary& s)
+{
+	if (s.failed)
+		return std::string(kSummaryBegin) + "\nVerdict:    " + s.verdict + "\n" + kSummaryEnd + "\n\n";
+
+	std::ostringstream out;
+	out << kSummaryBegin << "\n";
+	out << "Verdict:    " << s.verdict << "\n";
+	out << "Confidence: " << s.confidence << "\n";
+	out << "What:       " << s.title << "\n";
+	if (s.uptime >= 0)
+		out << "Uptime:     " << s.uptime / 60 << "m" << s.uptime % 60 << "s\n";
+	out << "\nWhat happened:\n";
+	Wrap(out, s.explanation, "  ");
+	if (!s.evidence.empty())
+	{
+		out << "\nEvidence:\n";
+		for (const std::string& e : s.evidence)
+			out << "  " << e << "\n";
+	}
+	if (!s.pluginInfo.empty())
+		out << "\nPlugin:     " << s.pluginInfo << "\n";
+	if (!s.advice.empty())
+	{
+		out << "\nWhat to do:\n";
+		for (size_t i = 0; i < s.advice.size(); ++i)
+		{
+			std::ostringstream item;
+			Wrap(item, s.advice[i], "     ");
+			std::string text = item.str();
+			out << "  " << (i + 1) << "." << text.substr(4);
+		}
+	}
+	if (!s.cssRecorded)
+		out << "\nNote: no CounterStrikeSharp activity was recorded (CounterStrikeSharp without the crash\n      recorder, or not installed), so plugins can only be blamed from the game error.\n";
+	out << "\n" << kSignaturePrefix << s.signature << "\n";
+	out << kSummaryEnd << "\n\n";
+	return out.str();
+}
+
+std::string SummaryToJson(const Summary& s)
+{
+	nlohmann::json json = {
+		{ "version", 1 },
+		{ "verdict", s.verdict },
+		{ "cause", s.cause },
+		{ "plugin", s.plugin.empty() ? nlohmann::json() : nlohmann::json(s.plugin) },
+		{ "module", s.module.empty() ? nlohmann::json() : nlohmann::json(s.module) },
+		{ "confidence", s.confidence.empty() ? nlohmann::json() : nlohmann::json(s.confidence) },
+		{ "title", s.title },
+		{ "explanation", s.explanation },
+		{ "advice", s.advice },
+		{ "evidence", s.evidence },
+		{ "signature", s.signature },
+		{ "uptime", s.uptime >= 0 ? nlohmann::json(s.uptime) : nlohmann::json() },
+		{ "cssRecorded", s.cssRecorded },
+		{ "failed", s.failed },
+	};
+	// Invalid UTF-8 from a plugin's log line is replaced rather than thrown on.
+	return json.dump(2, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
+}
+
+std::string BuildSummary(const std::string& report, const std::vector<Rule>& rules)
+{
+	return FormatSummary(Analyze(report, rules));
+}
+
+std::string BuildSummaryJson(const std::string& report, const std::vector<Rule>& rules)
+{
+	return SummaryToJson(Analyze(StripSummary(report), rules));
+}
+
+std::string StripSummary(const std::string& report)
+{
+	if (!HasSummary(report))
+		return report;
+	size_t end = report.find(std::string("\n") + kSummaryEnd);
+	if (end == std::string::npos)
+		return report;
+	end = report.find_first_not_of('\n', end + 1 + strlen(kSummaryEnd));
+	return end == std::string::npos ? std::string() : report.substr(end);
 }
 
 } // namespace crash_analysis

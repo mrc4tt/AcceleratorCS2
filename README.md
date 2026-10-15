@@ -38,6 +38,8 @@ Plugins are only named with a CounterStrikeSharp build that has the crash record
 
 Reports written by older versions get a summary on the next start.
 
+The same summary is also written as JSON next to each report (`<id>.summary.json`, `fatal-<unixtime>.summary.json`), for tools that read the dumps folder, such as a hosting panel, so they don't have to parse the text. It has `verdict`, `cause` (`plugin`, `not_plugin`, `module` or `unknown`), `plugin`, `module`, `confidence`, `title`, `explanation`, `advice`, `evidence`, `signature` and `uptime`, and is scrubbed like the report. Reports that already have a text summary get their JSON file on the next start.
+
 ### Custom rules
 
 `addons/AcceleratorCS2/crash_rules.json` (optional) adds rules that are tried before the built-in ones. It is a JSON array:

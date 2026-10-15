@@ -696,9 +696,51 @@ static void ScrubString(std::string& text)
 	}
 }
 
+// <id>.dmp.txt or fatal-<unixtime>.txt -> <id>.summary.json / fatal-<unixtime>.summary.json, next to it.
+static std::filesystem::path SummaryJsonPath(const std::filesystem::path& report)
+{
+	std::string name = report.filename().string();
+	for (const char* suffix : { ".dmp.txt", ".txt" })
+	{
+		size_t len = strlen(suffix);
+		if (name.size() > len && name.compare(name.size() - len, len, suffix) == 0)
+		{
+			name.resize(name.size() - len);
+			break;
+		}
+	}
+	return report.parent_path() / (name + ".summary.json");
+}
+
+// The summary as JSON next to the report, for tools that read the dumps folder (e.g. a hosting panel).
+// Scrubbed like the report. Written once; a failed write is retried on the next start.
+static void WriteSummaryJson(const std::filesystem::path& report, const std::string& content)
+{
+	std::filesystem::path path = SummaryJsonPath(report);
+	std::error_code ec;
+	if (std::filesystem::exists(path, ec))
+		return;
+
+	std::string json = crash_analysis::BuildSummaryJson(content, g_CrashRules);
+	ScrubString(json);
+
+	std::filesystem::path temp = path;
+	temp += ".tmp";
+	{
+		std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+		if (!out)
+			return;
+		out << json;
+	}
+	std::filesystem::rename(temp, path, ec);
+	if (ec)
+		std::filesystem::remove(temp, ec);
+}
+
 // Puts a plain-language CRASH SUMMARY (see crash_analysis.h) at the top of a finished report and returns it,
-// scrubbed, for printing. Empty if the report already has one or can't be read. Allocates: in the crash
-// handler it only runs after the stack walk, which allocates already.
+// scrubbed, for printing, and writes it as JSON next to the report. Empty if the report already has one or
+// can't be read; its JSON is still written if missing. Allocates: in the crash handler it only runs after the
+// stack walk, which allocates already.
 static std::string AddSummaryToReport(const std::filesystem::path& path)
 {
 	std::string content;
@@ -710,8 +752,14 @@ static std::string AddSummaryToReport(const std::filesystem::path& path)
 		buffer << in.rdbuf();
 		content = buffer.str();
 	}
-	if (content.empty() || crash_analysis::HasSummary(content))
+	if (content.empty())
 		return std::string();
+	if (crash_analysis::HasSummary(content))
+	{
+		// Reports from 3.9 before the JSON file existed.
+		WriteSummaryJson(path, content);
+		return std::string();
+	}
 
 	std::string summary = crash_analysis::BuildSummary(content, g_CrashRules);
 	{
@@ -721,6 +769,7 @@ static std::string AddSummaryToReport(const std::filesystem::path& path)
 		out << summary << content;
 	}
 	ScrubFileBeforeUpload(path);
+	WriteSummaryJson(path, content);
 	ScrubString(summary);
 	return summary;
 }
