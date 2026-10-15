@@ -1,5 +1,11 @@
+-- s2sdk moved tier1 sources to tier0_perproject; support both layouts.
+SDK_CONVAR_CPP = path.join(SDK_PATH, "tier0_perproject", "convar.cpp")
+if not os.isfile(SDK_CONVAR_CPP) then
+	SDK_CONVAR_CPP = path.join(SDK_PATH, "tier1", "convar.cpp")
+end
+
 files {
-	path.join(SDK_PATH, "tier1", "convar.cpp"),
+	SDK_CONVAR_CPP,
 	path.join(SDK_PATH, "entity2", "entityidentity.cpp"),
 	path.join(SDK_PATH, "entity2", "entitysystem.cpp"),
 }

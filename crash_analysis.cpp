@@ -35,6 +35,18 @@ const char* const kBuiltinRules = R"json([
       "Switch to another map to confirm the server itself is fine."
     ],
     "pluginCause": false
+  },
+  {
+    "id": "game-files-changed",
+    "engineError": "is corrupt. Verify integrity of game files",
+    "title": "Game files changed while the server was running (CS2 update)",
+    "explanation": "The game found that one of its own .vpk files (e.g. pak01.vpk) no longer matches what it loaded at startup. This almost always means CS2 was updated on disk while the server was still running, so the server stopped itself. It is not caused by a plugin and cannot be prevented from inside the game.",
+    "advice": [
+      "Restart the server so it loads the updated files.",
+      "Stop the server before updating CS2 (most hosting panels have a setting to stop servers before an update), or update to a separate folder and switch over.",
+      "If it happens without an update, verify the game files (steamcmd: app_update 730 validate)."
+    ],
+    "pluginCause": false
   }
 ])json";
 
