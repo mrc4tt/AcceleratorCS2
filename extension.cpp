@@ -188,12 +188,18 @@ class FatalErrorListener : public ILoggingListener
 public:
 	void Log(const LoggingContext_t* pContext, const tchar* pMessage) override
 	{
-		if (!pContext || pContext->m_Severity < LS_WARNING)
+		if (!pContext)
 			return;
 
-		RecordEngineMessage(pContext->m_Severity, pMessage);
+		// Some fatal errors (e.g. "Content file ... is corrupt" after a CS2 update on disk) are not always
+		// logged at LS_ERROR, so the text counts too.
+		bool fatal = pContext->m_Severity == LS_ERROR || (pMessage && strstr(pMessage, "FATAL ERROR"));
+		if (pContext->m_Severity < LS_WARNING && !fatal)
+			return;
 
-		if (pContext->m_Severity != LS_ERROR)
+		RecordEngineMessage(fatal ? LS_ERROR : pContext->m_Severity, pMessage);
+
+		if (!fatal)
 			return;
 
 		size_t len = 0;
