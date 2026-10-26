@@ -12,6 +12,24 @@ if(MM_PATH == nil) then
 	error("INVALID METAMOD PATH")
 end
 
+-- SDK headers include generated protobuf headers (networkbasetypes.pb.h etc.); generate them with the
+-- protoc the SDK ships, which matches its thirdparty/protobuf-3.21.8.
+PB_PATH = path.join(_MAIN_SCRIPT_DIR, "build", "pb")
+if(_ACTION ~= nil and _ACTION ~= "package") then
+	local protoc = os.host() == "windows"
+		and path.join(SDK_PATH, "devtools", "bin", "protoc.exe")
+		or path.join(SDK_PATH, "devtools", "bin", "linux", "protoc")
+	local protos = { "network_connection.proto", "networkbasetypes.proto", "netmessages.proto", "valveextensions.proto" }
+
+	os.mkdir(PB_PATH)
+	local ok = os.execute(string.format('%s "%s" && "%s" -I. -I"%s" --cpp_out="%s" %s',
+		os.host() == "windows" and "cd /d" or "cd", path.join(SDK_PATH, "common"), protoc,
+		path.join(SDK_PATH, "thirdparty", "protobuf-3.21.8", "src"), PB_PATH, table.concat(protos, " ")))
+	if not ok then
+		error("PROTOC FAILED")
+	end
+end
+
 newaction {
 	trigger = "package",
 	description = "Package AcceleratorCS2",
@@ -58,7 +76,8 @@ workspace "AcceleratorCS2"
 		"x64"
 	}
 	location "build"
-	filter "system:windows"
+	-- MSVC syntax; clang (scripts/build-windows.sh) reads sources as UTF-8 by default.
+	filter { "system:windows", "toolset:msc*" }
 		buildoptions { "/utf-8" }
 	filter "system:linux"
 		toolset "clang"
@@ -143,4 +162,5 @@ project "AcceleratorCS2"
 	includedirs {
 		path.join("vendor", "breakpad", "src"),
 		path.join("vendor", "fmt", "include"),
+		PB_PATH,
 	}

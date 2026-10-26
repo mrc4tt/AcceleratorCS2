@@ -126,10 +126,12 @@ volatile sig_atomic_t g_CommandHistoryNext = 0;
 // isn't retried on every boot.
 static const char kStackwalkFailedMarker[] = "-------- STACKWALK FAILED --------";
 
-class GameSessionConfiguration_t { };
 #if defined _LINUX
 KHook::Virtual<IServerGameDLL, void, bool, bool, bool> gameFrameHook(&IServerGameDLL::GameFrame, &g_AcceleratorCS2, nullptr, &AcceleratorCS2::GameFrame);
 #endif
+// Also run on a late load. Calling StartupServer directly would have to construct a
+// GameSessionConfiguration_t, a protobuf message whose code isn't linked into the plugin.
+static void OnServerStartup();
 KHook::Virtual<INetworkServerService, void, const GameSessionConfiguration_t&, ISource2WorldSession*, const char*> startupServerHook(&INetworkServerService::StartupServer, &g_AcceleratorCS2, nullptr, &AcceleratorCS2::StartupServer);
 KHook::Virtual<IServerGameDLL, void> preShutdownHook(static_cast<void (IServerGameDLL::*)()>(&IServerGameDLL::PreShutdown), &g_AcceleratorCS2, &AcceleratorCS2::PreShutdown, nullptr);
 KHook::Virtual<ICvar, void, ConCommandRef, const CCommandContext&, const CCommand&> dispatchConCommandHook(&ICvar::DispatchConCommand, &g_AcceleratorCS2, &AcceleratorCS2::DispatchConCommand, nullptr);
@@ -2276,7 +2278,7 @@ bool AcceleratorCS2::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen
 #endif
 
 	if (late)
-		StartupServer(nullptr, {}, nullptr, nullptr);
+		OnServerStartup();
 
 	g_LoadTime = time(nullptr);
 
@@ -2398,13 +2400,18 @@ KHook::Return<void> AcceleratorCS2::GameFrame(IServerGameDLL* pThis, bool simula
 
 #endif
 
-KHook::Return<void> AcceleratorCS2::StartupServer(INetworkServerService* pThis, const GameSessionConfiguration_t& config, ISource2WorldSession*, const char*)
+static void OnServerStartup()
 {
 	strncpy(crashMap, g_pNetworkServerService->GetIGameServer()->GetMapName(), sizeof(crashMap) - 1);
 
 	// Plugins can be added or hot-reloaded between maps.
 	BuildPluginList();
 	FindCssCrashContext();
+}
+
+KHook::Return<void> AcceleratorCS2::StartupServer(INetworkServerService* pThis, const GameSessionConfiguration_t& config, ISource2WorldSession*, const char*)
+{
+	OnServerStartup();
 
 	return {KHook::Action::Ignore};
 }
