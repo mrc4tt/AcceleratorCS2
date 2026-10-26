@@ -1,8 +1,9 @@
 name: CI
 
+# Manual only: releases are built and published on the build server (cs2-build-system, started from
+# server-ops), local builds use scripts/build-*.sh. Run it from Actions -> CI -> Run workflow when a
+# hosted build is wanted.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
     inputs:
       target:
@@ -42,7 +43,7 @@ jobs:
       - name: Checkout HL2SDK
         uses: actions/checkout@v7
         with:
-          repository: alliedmodders/s2sdk
+          repository: mrc4tt/hl2sdk
           ref: cs2
           path: hl2sdk-cs2
 
@@ -84,73 +85,3 @@ jobs:
     with:
       runtime: steamrt4
       artifact: SteamRT4
-
-  # Releases automatically: on a push to master, the version returned by AcceleratorCS2::GetVersion()
-  # in extension.cpp is read, and if tag v<version> doesn't exist yet it's created together with a
-  # GitHub release. So bumping GetVersion() is all it takes to publish a release; other pushes don't
-  # release anything. Pushing a tag by hand still releases that tag.
-  release:
-    name: Release
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
-    needs: [windows, steamrt3, steamrt4]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Determine version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            version="$(grep -A2 'AcceleratorCS2::GetVersion()' extension.cpp | sed -n 's/.*return "\(.*\)".*/\1/p')"
-            if [ -z "$version" ]; then
-              echo "::error::could not read the version from AcceleratorCS2::GetVersion() in extension.cpp"
-              exit 1
-            fi
-            tag="v$version"
-          fi
-
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists, nothing to do (bump GetVersion() to publish a new one)."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Publishing $tag"
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Download artifacts
-        if: steps.version.outputs.publish == 'true'
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Package
-        if: steps.version.outputs.publish == 'true'
-        working-directory: artifacts
-        run: |
-          name="${{ github.event.repository.name }}-${{ steps.version.outputs.tag }}"
-          (cd SteamRT3 && tar -czf "../$name-steamrt3.tar.gz" *)
-          (cd SteamRT4 && tar -czf "../$name-steamrt4.tar.gz" *)
-          (cd Windows && zip -qr "../$name-windows.zip" *)
-          ls -la *.tar.gz *.zip
-
-      # Creates the tag on this commit if it doesn't exist. Tags created with the workflow token don't
-      # trigger another workflow run, so this doesn't build twice.
-      - name: Release
-        if: steps.version.outputs.publish == 'true'
-        run: |
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --target "$GITHUB_SHA" \
-            --title "${{ steps.version.outputs.tag }}" \
-            --notes "### Metamod \`2.0-1461\` or later is required!" \
-            --generate-notes \
-            artifacts/*.tar.gz artifacts/*.zip

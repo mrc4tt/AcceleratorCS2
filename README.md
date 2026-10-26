@@ -104,11 +104,31 @@ scripts/build-linux.sh            # both runtimes -> dist/steamrt3, dist/steamrt
 scripts/build-linux.sh steamrt4   # just one
 ```
 
-`HL2SDKCS2` and `MMSOURCE_DEV` are used if set, otherwise hl2sdk (`cs2`) and metamod-source (`master`) are cloned into `.deps/`. Metamod must be new enough to have `METAMOD_PLAPI_VERSION` 18 (KHook), older headers produce a plugin current Metamod refuses to load.
+`HL2SDKCS2` and `MMSOURCE_DEV` are used if set, otherwise [mrc4tt/hl2sdk](https://github.com/mrc4tt/hl2sdk) (`cs2`) and metamod-source (`master`) are cloned into `.deps/`. Metamod must be new enough to have `METAMOD_PLAPI_VERSION` 18 (KHook), older headers produce a plugin current Metamod refuses to load.
+
+The Windows package is cross-compiled on Linux too (`docker/windows.Dockerfile`): clang targeting `x86_64-pc-windows-msvc` with lld-link, against an MSVC CRT / Windows SDK sysroot made by [xwin](https://github.com/Jake-Shadle/xwin) (`~/.xwin`, or `XWIN_DIR`; created with `xwin --accept-license splat` if missing):
+
+```sh
+scripts/build-windows.sh          # -> dist/windows
+```
+
+### Releases
+
+Releases are built and published on the build server by [cs2-build-system](https://github.com/mrc4tt/cs2-build-system)'s `build-all.sh`, in the same images as above (`scripts/container-build.sh`), started from [server-ops](https://github.com/mrc4tt/server-ops) (the `release` workflow or the dashboard's Releases tab):
+
+```sh
+gh workflow run release -R mrc4tt/server-ops -f only=AcceleratorCS2                   # dry run: version plan + build
+gh workflow run release -R mrc4tt/server-ops -f only=AcceleratorCS2 -f dry_run=false  # bump, tag, push, release
+gh workflow run release -R mrc4tt/server-ops -f only=AcceleratorCS2 -f version=4.0 -f dry_run=false
+```
+
+The version is `AcceleratorCS2::GetVersion()` in `extension.cpp`, tag `v<version>`. With changes since the last release it's bumped (commit "Release vX") before the build; a `GetVersion()` you bumped by hand is released as is. Push your commits first, the server builds what's on `master`.
+
+`scripts/release.sh` does the same from your own machine (build everything, then `gh release create`), as a fallback.
 
 ### CI
 
-`.github/workflows/build.yml` runs Windows, SteamRT3 and SteamRT4 as separate jobs (the Linux ones through `.github/workflows/linux-build.yml`). A manual run (Actions → CI → Run workflow) can build just one of them. Releases are automatic: on a push to `master`, if the version returned by `AcceleratorCS2::GetVersion()` in `extension.cpp` has no `v<version>` release yet, the tag and a GitHub release with all three packages are created. Bump `GetVersion()` to publish a new release; other pushes don't release anything.
+`.github/workflows/build.yml` only runs manually (Actions → CI → Run workflow), pushes and pull requests no longer build. It runs Windows, SteamRT3 and SteamRT4 as separate jobs (the Linux ones through `.github/workflows/linux-build.yml`), can build just one of them, and uploads the packages as workflow artifacts. It doesn't release anything.
 
 ### Self-hosted CI runner
 

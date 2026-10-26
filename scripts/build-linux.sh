@@ -3,7 +3,7 @@
 #
 # Usage: scripts/build-linux.sh [steamrt3|steamrt4|all]   (default: all)
 #
-# Uses $HL2SDKCS2 / $MMSOURCE_DEV if set, otherwise clones s2sdk (cs2) and metamod-source (master)
+# Uses $HL2SDKCS2 / $MMSOURCE_DEV if set, otherwise clones mrc4tt/hl2sdk (cs2) and metamod-source (master)
 # into .deps/. Packages end up in dist/<runtime>/.
 set -euo pipefail
 
@@ -26,7 +26,7 @@ SDK="${HL2SDKCS2:-$ROOT/.deps/hl2sdk-cs2}"
 MM="${MMSOURCE_DEV:-$ROOT/.deps/mmsource-2.0}"
 
 if [ ! -d "$SDK" ]; then
-	git clone --depth 1 -b cs2 https://github.com/alliedmodders/s2sdk "$SDK"
+	git clone --depth 1 -b cs2 https://github.com/mrc4tt/hl2sdk "$SDK"
 fi
 if [ ! -d "$MM" ]; then
 	git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/alliedmodders/metamod-source "$MM"
@@ -42,14 +42,11 @@ for rt in "${RUNTIMES[@]}"; do
 	# Cheap when nothing changed: docker reuses the cached layers.
 	docker build -t "acceleratorcs2-build:$rt" -f "$ROOT/docker/$rt.Dockerfile" "$ROOT/docker"
 
-	# Objects from the other runtime's toolchain must not be reused.
-	rm -rf "$ROOT/build" "$ROOT/bin"
-
 	docker run --rm -u "$(id -u):$(id -g)" \
 		-v "$ROOT:/src" -v "$SDK:/deps/hl2sdk-cs2:ro" -v "$MM:/deps/mmsource-2.0:ro" -w /src \
 		-e HL2SDKCS2=/deps/hl2sdk-cs2 -e MMSOURCE_DEV=/deps/mmsource-2.0 \
 		"acceleratorcs2-build:$rt" \
-		sh -c 'premake5 gmake && make -C build config=release_x64 -j"$(nproc)" && premake5 package'
+		sh scripts/container-build.sh linux
 
 	rm -rf "$ROOT/dist/$rt"
 	mkdir -p "$ROOT/dist"
