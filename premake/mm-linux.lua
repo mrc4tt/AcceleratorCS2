@@ -22,6 +22,9 @@ linkoptions {
 	"-l:libtier0.so",
 	"-l:interfaces.a",
 	"-l:mathlib.a",
+	-- An object without a .note.GNU-stack section makes the steamrt3 linker mark the stack
+	-- executable, and glibc 2.41 refuses to dlopen such a library
+	"-Wl,-z,noexecstack",
 }
 
 includedirs {
