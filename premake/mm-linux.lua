@@ -9,6 +9,8 @@ files {
 	SDK_CONVAR_CPP,
 	path.join(SDK_PATH, "entity2", "entityidentity.cpp"),
 	path.join(SDK_PATH, "entity2", "entitysystem.cpp"),
+	path.join(SDK_PATH, "entity2", "entitykeyvalues.cpp"),
+	path.join(SDK_PATH, "tier0_perproject", "keyvalues3.cpp"),
 }
 
 libdirs {
