@@ -2444,7 +2444,7 @@ const char* AcceleratorCS2::GetLicense()
 
 const char* AcceleratorCS2::GetVersion()
 {
-	return "3.9";
+	return "3.10";
 }
 
 const char* AcceleratorCS2::GetDate()
